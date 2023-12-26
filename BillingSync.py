@@ -139,12 +139,12 @@ class BillingSync:
     tableSizes = []
     tableSizes.append( len( max(list(x["subscriberIp"] for x in data["subscribers"]), key=len) ) )
     tableSizes.append( len( max(list(x["policyName"] for x in data["policies"]), key=len) ) )
-    tableSizes.append( len( max(list(x["policyId"] for x in data["policies"]), key=len) ) )
+    tableSizes.append( len( max(list(str(x["policyId"]) for x in data["policies"]), key=len) ) )
     tableSizes.append( len( max(list(str(x["rateLimitDownlink"]["rate"]) for x in data["policies"]) + ["Dn Kbps"], key=len) ) )
     tableSizes.append( len( max(list(str(x["rateLimitUplink"]["rate"]) for x in data["policies"]) + ["Up Kbps"], key=len) ) )
-    tableSizes.append( len( max(list(x["state"] for x in data["subscribers"]), key=len) ) )
+    tableSizes.append( len( max(list(str(x["state"]) for x in data["subscribers"]), key=len) ) )
     tableSizes.append( len("Block") )
-    tableSizes.append( len( max(list(x["subscriberId"] for x in data["subscribers"]), key=len) ) )
+    tableSizes.append( len( max(list(str(x["subscriberId"]) for x in data["subscribers"]), key=len) ) )
 
     rowFormat = ''
     for size in tableSizes:
