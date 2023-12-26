@@ -46,7 +46,7 @@ Enable REST API in BQN.
 
 ## Running the script
 
-Every time a synchronization is needed, run the script. Use -h flag to see the options, including the BQN IP, user and password and the billing server and credentials.
+Every time a synchronization is needed, run the script. Use -h flag to see the options, including the BQN IP, user and password and the billing server and credentials. The file BillingSync.py must be in the same directory as the script.
 
 The script does not include periodic execution, this should be done externally. In Linux, the script can be run periodically using crontab (for example, every 15 minutes).
 

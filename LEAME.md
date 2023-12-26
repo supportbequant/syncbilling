@@ -44,7 +44,7 @@ Habilitar la REST API en el BQN.
 
 ## Ejecución del script
 
-Cada vez que se requiera una sincronización, ejecute el script. Use la opción -h para ver las opciones, incluidas la IP, usuario y contraseña dell BQN y el servidor y credenciales del billing.
+Cada vez que se requiera una sincronización, ejecute el script. Use la opción -h para ver las opciones, incluidas la IP, usuario y contraseña dell BQN y el servidor y credenciales del billing. El fichero BillingSync.py debe estar en el mismo directorio del script.
 
 El script no incluye programación de ejecución periódica, que deberá hacerse externamente. En Linux, se puede hacer que el script se ejecute periódicamente usando crontab (por ejemplo cada quince minutos):
 
