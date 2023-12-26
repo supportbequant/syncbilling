@@ -1,0 +1,155 @@
+#!/usr/bin/python3
+
+################################################################################
+#
+# Copyright (c) 2022 Bequant S.L.
+# All rights reserved.
+#
+# This product or document is proprietary to and embodies the
+# confidential technology of Bequant S.L., Spain.
+# Possession, use, duplication or distribution of this product
+# or document is authorized only pursuant to a valid written
+# license from Bequant S.L.
+#
+#
+################################################################################
+
+import json
+import argparse
+import json
+
+import requests
+if not requests.__version__.startswith("1."):
+  # Avoid insecure warning when issuing REST queries
+  import urllib3
+  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from BillingSync import BillingSync
+
+################################################################################
+
+class AzotelSync(BillingSync):
+
+  ############################################################################
+
+  def getEntries(self, server, user, password, query, bodyParams={}):
+    url = "https://" + server + "/restapi" + query
+    headers = {
+      "Accept": "application/json",
+      "Accept-Encoding": "gzip, deflate",
+      "Connection": "keep-alive",
+      "Content-type": "application/json"
+    }
+    body = {
+      "api_username": user,
+      "api_password": password
+    }
+    for p in bodyParams:
+      body[p] = bodyParams[p]
+
+    self.logger.info("POST to %s" % url)
+    rsp = requests.post(url, headers=headers, data=self.jsonDumps(body), verify=False)
+    self.printResponseDetails(rsp)
+    if rsp.status_code != 200:
+      raise Exception("Bad query %d" % rsp.status_code)
+    rspJson = json.loads(rsp.text)
+    if rspJson["result"]:
+      return rspJson["result"]
+    else:
+      return None
+
+  def obtainSiteEquipments(self, sites):
+    equipments = []
+    for site in sites["siteData"]:
+      for equipment in site["equipment"]:
+        equipments.append({
+          "sitename": site["sitename"],
+          "nickname": equipment["nickname"],
+          "equipid": equipment["equipid"]
+        })
+    return equipments
+
+  def normalizeData(self, customers, cpes, sites):
+    data = {'subscribers': [], 'policies': []}
+    equipments = self.obtainSiteEquipments(sites)
+
+    for c in customers["customerBucketData"]:
+      match = [ x for x in data["policies"] if x["policyName"] == c["bucket"]["name"]]
+      if len(match) == 0:
+        data["policies"].append({
+          "policyName": c["bucket"]["name"],
+          "policyId": "From Azotel",
+          "rateLimitUplink": {"rate": int(c["bucket"]["uploadrate"])},
+          "rateLimitDownlink": {"rate": int(c["bucket"]["downloadrate"])}
+          })
+      subGroups = []
+      foundCpes = [x for x in cpes["cpe"] if x["customerid"] == c["customerid"]]
+      for cpe in foundCpes:
+        parentId = cpe["parent"]
+        if parentId:
+          foundEquipments = [x for x in equipments if x["equipid"] == parentId]
+          if len(foundEquipments) == 1:
+            # Equipment (e.g. AP) and Site groups added.
+            subGroups.append("L1-" + foundEquipments[0]["nickname"])
+            subGroups.append("L2-" + foundEquipments[0]["sitename"])
+          else:
+            self.logger.warning("More than one equipment found with same equipid %s" % parentId)
+      # Remove duplicates
+      subGroups = list(set(subGroups))
+      for ip in c["ipaddresses"]:
+        data["subscribers"].append({
+          "subscriberIp": ip["ip"],
+          "subscriberId": c["name"],
+          "policyRate" : c["bucket"]["name"],
+          "block": c["status"] != "current",
+          "state": c["status"],
+          "subscriberGroups": subGroups
+        })
+
+    return data
+
+################################################################################
+
+if __name__ == "__main__":
+
+  parser = argparse.ArgumentParser(
+    description="""
+  Synchronizes speed limits in Azotel with BQN rate policies.
+
+  Requires an user and password in Azotel and the REST API enabled in BQN.
+
+  BQN Rate policies are identified by Azotel bucket "name", with spaces replaced by undescores.
+  BQN subscribers are identified by Azotel customer "name".
+  Subscribers in state != "current" have their traffic blocked by BQN.
+
+  Known limitations:
+  - Multiple IP addresses in same contract not supported.
+  - Synchronization may take several minutes.
+  - If the synchronization fails, no retry is attempted (must be don e externally).
+  - No scheduling of script execution (must be done externally).
+  """, formatter_class=argparse.RawTextHelpFormatter)
+
+  parser.add_argument('-b', help='BQN address and REST credentials. If absent, no BQN synchromization',
+                      nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
+  parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
+                    help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('server', metavar='AZ-SERVER', type=str, help='Billing REST server')
+  parser.add_argument('user', metavar='AZ-USER', type=str, help='Billing REST user')
+  parser.add_argument('password', metavar='AZ-PASSWORD', type=str, help='Billing REST password')
+  args = parser.parse_args()
+
+  billingSync = AzotelSync(args.verbose)
+
+  #customers = billingSync.getEntries(args.server, args.user, args.password, "/listCustomerBucketData",
+  #                                   bodyParams={"allcustomers": "1", "includenobucket": "1"})
+  customers = billingSync.getEntries(args.server, args.user, args.password, "/listCustomerBucketData")  # Returns only client with IP and limits
+  cpes = billingSync.getEntries(args.server, args.user, args.password, "/getCPEData", bodyParams={"all": "1"})
+  sites = billingSync.getEntries(args.server, args.user, args.password, "/listSiteData")
+  data = billingSync.normalizeData(customers, cpes, sites)
+  billingSync.printData(data)
+  if args.bqn:
+    billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
+
+
+
+

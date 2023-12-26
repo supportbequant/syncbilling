@@ -1,0 +1,366 @@
+#!/usr/bin/python3
+
+################################################################################
+#
+# Copyright (c) 2022 Bequant S.L.
+# All rights reserved.
+#
+# This product or document is proprietary to and embodies the
+# confidential technology of Bequant S.L., Spain.
+# Possession, use, duplication or distribution of this product
+# or document is authorized only pursuant to a valid written
+# license from Bequant S.L.
+#
+#
+################################################################################
+
+import json
+import argparse
+
+import requests
+if not requests.__version__.startswith("1."):
+  # Avoid insecure warning when issuing REST queries
+  import urllib3
+  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from BillingSync import BillingSync
+
+
+################################################################################
+
+class VispSync(BillingSync):
+
+  ############################################################################
+
+  def getEntries(self, server, key, query):
+    url = "https://" + server + "/graphql"
+    headers = {
+   "authorization": "%s" % key,
+   "Content-Type": "application/json",
+   "Accept-Encoding": "chunked"
+  }
+    queryJson = {
+      "query": """query BqnQuery {
+       %s
+      }""" % query
+    }
+
+    self.logger.info("POST to %s" % url)
+    rsp = requests.post(url, headers=headers, data=self.jsonDumps(queryJson), verify=False)
+    self.printResponseDetails(rsp)
+    if rsp.status_code != 200:
+      raise Exception("Bad query %d" % rsp.status_code)
+    rspJson = json.loads(rsp.text)
+    if rspJson["data"]:
+      return rspJson["data"]
+    else:
+      return None
+
+  def getCustomerEntries(self, server, key):
+    query = """
+    customers (status:[1,2,4,8,9]) {
+      customer_id
+      first_name
+      last_name
+      username
+      status
+      package_instances {
+        status
+        service_instances {
+          status
+          service_number
+          service_details {
+            ...on ServiceTypeWifi {
+              up_speed
+              up_speed_unit
+              down_speed
+              down_speed_unit
+              up_burst
+              up_burst_unit
+              down_burst
+              down_burst_unit
+              burst_seconds
+              burst_time_unit
+              ip_address
+              mac_address
+              multiple_mac {
+                ip_address
+                mac_address
+              }
+            }
+            ...on ServiceTypeHotspot {
+              up_speed
+              up_speed_unit
+              down_speed
+              down_speed_unit
+              up_burst
+              up_burst_unit
+              down_burst
+              down_burst_unit
+              burst_seconds
+              burst_time_unit
+              ip_address
+              mac_address
+              multiple_mac {
+                ip_address
+                mac_address
+              }
+            }
+            ...on ServiceTypeOtherConnection {
+              up_speed
+              up_speed_unit
+              down_speed
+              down_speed_unit
+              up_burst
+              up_burst_unit
+              down_burst
+              down_burst_unit
+              burst_seconds
+              burst_time_unit
+              ip_address
+              mac_address
+            }
+            ...on ServiceTypeVpn {
+              up_speed
+              up_speed_unit
+              down_speed
+              down_speed_unit
+              up_burst
+              up_burst_unit
+              down_burst
+              down_burst_unit
+              burst_seconds
+              burst_time_unit
+              ip_address
+            }
+          }
+        }
+      }
+    }
+"""
+    rsp = self.getEntries(server, key, query)
+    if rsp:
+      return rsp["customers"]
+    else:
+      return None
+
+  def getServiceEntries(self, server, key):
+    query = """
+serviceList {
+    service_id
+    service_name
+    service_type
+    service_enabled
+    default_techcode
+  }
+"""
+    rsp = self.getEntries(server, key, query)
+    if rsp:
+      return rsp["serviceList"]
+    else:
+      return None
+
+  def getCpeEntries(self, server, key):
+    query = """
+customerCPEwithWirelessServiceSpeeds
+"""
+    rsp = self.getEntries(server, key, query)
+    if rsp:
+      return rsp["customerCPEwithWirelessServiceSpeeds"]
+    else:
+      return None
+
+  ############################################################################
+
+  def convertToKpbs(self, speed, units):
+    if units == "kbps":
+      return speed
+    elif units == "mbps":
+      return speed*1000
+    elif units == "gbps":
+      return speed*(10**6)
+    else:
+      self.logger.warning("Speed %d with unknown units %s, Mbps taken" % (speed, units))
+      return speed*1000
+
+  def convertToSpeedLabel(self, speed):
+    # speed in Kbps
+    s = speed//(10**6)
+    if s > 0:
+      return "%dG" % s
+    s = speed//(10**3)
+    if s > 0:
+      return "%dM" % s
+    return "%dK" % s
+
+  def getPolicyName(self, upRate, dnRate, upBustRate, dnBustRate, bustDuration):
+    rsp = "VP-"
+    if upRate > 0:
+      rsp += self.convertToSpeedLabel(upRate) + '/'
+    if dnRate > 0:
+      rsp += self.convertToSpeedLabel(dnRate)
+    if upBustRate > 0:
+      rsp += '-' + self.convertToSpeedLabel(upBustRate) + '/'
+    if dnBustRate > 0:
+      rsp += self.convertToSpeedLabel(dnBustRate)
+    if bustDuration > 0:
+      rsp += '-' + str(bustDuration)
+    return rsp
+
+  def getStatus(self, cltStatus, pktStatus, srvStatus):
+    if cltStatus == 1:
+      rsp = "PaidUp"
+    elif cltStatus == 2:
+      rsp = "Due"
+    elif cltStatus == 4:
+      rsp = "PstDue"
+    elif cltStatus == 8:
+      rsp = "Suspnd"
+    elif cltStatus == 9:
+      rsp = "Hibern"
+    elif cltStatus == 10:
+      rsp = "Inact"
+    elif cltStatus == 20:
+      rsp = "Deltd"
+    else:
+      rsp ="Unknown"
+    rsp += "-%s-%s" % (pktStatus[:6], srvStatus[:6])
+    return rsp
+
+  def normalizeData(self, customers, cpes):
+    data = {'subscribers': [], 'policies': []}
+
+    for cust in customers:
+      # Get subscriber groups from CPE information
+      subGroups = []
+      foundCpes = [ x for x in cpes if x["customer_id"] == cust["customer_id"] ]
+      for cpe in foundCpes:
+        for equipment in cpe["equipment"]:
+          if equipment["access_point_id"]:
+            subGroups.append("L1-%s" % equipment["access_point_id"])
+      subGroups = list(set(subGroups)) # Remove duplicates
+      # There might be several IPs under a customer. We will look for all of them
+      # and create a policy based on the service limits
+      for pkt in cust['package_instances']:
+        for si in pkt['service_instances']:
+          if not si['service_details']:
+            continue
+          srv = si['service_details']
+          upRate = self.convertToKpbs(srv['up_speed'], srv['up_speed_unit'])
+          dnRate = self.convertToKpbs(srv['down_speed'], srv['down_speed_unit'])
+          upBustRate = self.convertToKpbs(srv['up_burst'], srv['up_burst_unit'])
+          dnBustRate = self.convertToKpbs(srv['down_burst'], srv['down_burst_unit'])
+          burstDuration = srv['burst_seconds']
+          ips = []
+          if srv['ip_address']:
+            ips.append(srv['ip_address'])
+          if "multiple_mac" in srv:
+            for mmac in srv["multiple_mac"]:
+              if mmac['ip_address']:
+                ips.append(mmac['ip_address'])
+          # Remove duplicates by converting to a dictionary and back to a list
+          ips = list(dict.fromkeys(ips))
+          for ip in ips:
+            polName = self.getPolicyName(upRate, dnRate, upBustRate, dnBustRate, srv['burst_seconds'])
+            foundPolicies = [ x for x in data["policies"] if x["policyName"] == polName]
+            if len(foundPolicies) == 0:
+              data["policies"].append({
+                    "policyName": polName,
+                    "policyId": str(si["service_number"]),
+                    "rateLimitUplink": {
+                        "rate": upRate,
+                        "burstRate": upBustRate,
+                        "burstDuration": burstDuration,
+                        "burstThreshold": upRate,
+                        "burstThresholdWindow": 300
+                    },
+                    "rateLimitDownlink": {
+                        "rate": dnRate,
+                        "burstRate": dnBustRate,
+                        "burstDuration": burstDuration,
+                        "burstThreshold": dnRate,
+                        "burstThresholdWindow": 300
+                    }
+                })
+            data["subscribers"].append({
+                "subscriberIp": ip,
+                "subscriberId": cust["username"],
+                "policyRate" : polName,
+                "block": pkt["status"] != "ACTIVE" and si["status"] != "ACTIVE",
+                "state": self.getStatus(cust["status"], pkt["status"], si["status"]),
+                "subscriberGroups": subGroups
+            })
+    return data
+
+  ############################################################################
+
+  def generateKey(self, server, client, secret, user, password):
+    url = "https://" + server + "/token"
+    headers = {
+   "x-visp-client-id": client,
+   "x-visp-client-secret": secret,
+   "x-visp-username": user,
+   "x-visp-password": password,
+   "Content-Type": "application/json",
+   "Accept-Encoding": "chunked"
+    }
+
+    self.logger.info("GET to %s" % url)
+    rsp = requests.get(url, headers=headers, verify=False)
+    self.printResponseDetails(rsp)
+    rspJson = rsp.json()
+    if rsp.status_code != 200:
+      raise Exception("Bad query %d" % rsp.status_code)
+    if rspJson["token"]:
+      return rspJson["token"]
+    else:
+      return None
+
+################################################################################
+
+if __name__ == "__main__":
+
+  parser = argparse.ArgumentParser(
+    description="""
+  Synchronizes speed limits in Visp with BQN rate policies.
+
+  Requires an user and password in Visp and the REST API enabled in BQN.
+
+  BQN Rate policies are identified by Visp plan "name", with spaces replaced by undescores.
+  BQN subscribers are identified by Visp client "public-id".
+  Contracts in status == "disabled" have their traffic blocked by BQN (Wispro_block policy).
+
+  Known limitations:
+  - Multiple IP addresses in same contract not supported.
+  - Synchronization may take several minutes.
+  - If the synchronization fails, no retry is attempted (must be don e externally).
+  - No scheduling of script execution (must be done externally).
+  """, formatter_class=argparse.RawTextHelpFormatter)
+
+  parser.add_argument('-b', help='BQN address and REST credentials. If absent, no BQN synchromization',
+                      nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
+  parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
+                    help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('server', metavar='VP-SERVER', type=str, help='Billing REST server')
+  parser.add_argument('client', metavar='VP-CLIENT', type=str, help='Billing REST client')
+  parser.add_argument('secret', metavar='VP-SECRET', type=str, help='Billing REST secret')
+  parser.add_argument('user', metavar='VP-USER', type=str, help='Billing REST user')
+  parser.add_argument('password', metavar='VP-PASSWORD', type=str, help='Billing REST password')
+  args = parser.parse_args()
+
+  billingSync = VispSync(args.verbose)
+
+  key = billingSync.generateKey(args.server, args.client, args.secret, args.user, args.password)
+
+  customers = billingSync.getCustomerEntries(args.server, key)
+  #services = billingSync.getServiceEntries(args.server, key)
+  cpes = billingSync.getCpeEntries(args.server, key)
+
+  data = billingSync.normalizeData(customers, cpes)
+  billingSync.printData(data)
+  if args.bqn:
+    billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
+
+
+
+

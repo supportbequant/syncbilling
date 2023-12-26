@@ -1,0 +1,438 @@
+#!/usr/bin/python3
+
+################################################################################
+#
+# Copyright (c) 2022 Bequant S.L.
+# All rights reserved.
+#
+# This product or document is proprietary to and embodies the
+# confidential technology of Bequant S.L., Spain.
+# Possession, use, duplication or distribution of this product
+# or document is authorized only pursuant to a valid written
+# license from Bequant S.L.
+#
+#
+################################################################################
+
+import json
+import argparse
+
+import requests
+if not requests.__version__.startswith("1."):
+  # Avoid insecure warning when issuing REST queries
+  import urllib3
+  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from BillingSync import BillingSync
+
+################################################################################
+
+class SonarSync(BillingSync):
+
+  ############################################################################
+
+  def getAccounts(self, url, headers):
+    page = 1
+    remaining = True
+    maxPerPage = 10000
+    entries = []
+    query = """query AccountQuery ($paginator: Paginator) {
+    ip_assignment_histories(paginator: $paginator, removed_datetime: null) {
+      entities {
+        subnet
+        ipassignmenthistoryable {
+          ...on Account {
+            id
+            name
+            account_status {
+              id
+              name
+            }
+            account_services {
+              entities {
+                service (type:DATA) {
+                  id
+                  name
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }"""
+
+    while remaining:
+      self.logger.info("POST to %s, page %d" % (url, page))
+      payload = {
+      "query": query,
+        "variables": {
+          "paginator": {
+            "page": page,
+            "records_per_page": maxPerPage
+          }
+        }
+      }
+      rsp = requests.post(url, headers=headers, data=self.jsonDumps(payload), verify=False)
+      self.printResponseDetails(rsp)
+      if rsp.status_code != 200:
+        raise Exception("Bad query %d (page %d)" % (rsp.status_code, page))
+      rspJson = json.loads(rsp.text)
+      for e in rspJson["data"]["ip_assignment_histories"]["entities"]:
+        entries.append(e)
+      remaining = len(rspJson["data"]["ip_assignment_histories"]["entities"]) == maxPerPage
+      page += 1
+
+    return entries
+
+  ############################################################################
+
+  def getServices(self, url, headers):
+    page = 1
+    remaining = True
+    maxPerPage = 10000
+    entries = []
+    query = """query ServiceQuery ($paginator: Paginator) {
+    services (paginator: $paginator, type: DATA) {
+      entities {
+        id
+        name
+        type
+        data_service_detail {
+                    download_speed_kilobits_per_second
+                    upload_speed_kilobits_per_second
+        }
+      }
+    }
+  }"""
+
+    while remaining:
+      self.logger.info("POST to %s, page %d" % (url, page))
+      payload = {
+      "query": query,
+        "variables": {
+          "paginator": {
+            "page": page,
+            "records_per_page": maxPerPage
+          }
+        }
+      }
+      rsp = requests.post(url, headers=headers, data=self.jsonDumps(payload), verify=False)
+      self.printResponseDetails(rsp)
+      if rsp.status_code != 200:
+        raise Exception("Bad query %d (page %d)" % (rsp.status_code, page))
+      rspJson = json.loads(rsp.text)
+      for e in rspJson["data"]["services"]["entities"]:
+        entries.append(e)
+      remaining = len(rspJson["data"]["services"]["entities"]) == maxPerPage
+      page += 1
+
+    return entries
+
+  ############################################################################
+
+  def getDelinquents(self, url, headers):
+    page = 1
+    remaining = True
+    maxPerPage = 10000
+    entries = []
+    query = """query DelinquentQuery($rrf: ReverseRelationFilter, $paginator: Paginator) {
+    accounts(reverse_relation_filters: [$rrf], paginator: $paginator) {
+      entities {
+        id
+        name
+            account_status {
+              name
+            }
+      }
+    }
+  }
+  """
+
+    while remaining:
+      self.logger.info("POST to %s, page %d" % (url, page))
+      payload = {
+      "query": query,
+        "variables": {
+          "paginator": {
+            "page": page,
+            "records_per_page": maxPerPage
+          },
+          "rrf": {
+              "relation": "invoices",
+              "search": [
+                {
+                  "boolean_fields": [
+                    {
+                      "attribute": "delinquent",
+                      "search_value": True
+                    }
+                  ]
+                }
+              ]
+            }
+        }
+      }
+      rsp = requests.post(url, headers=headers, data=self.jsonDumps(payload), verify=False)
+      self.printResponseDetails(rsp)
+      if rsp.status_code != 200:
+        raise Exception("Bad query %d (page %d)" % (rspJson["status"], page))
+      rspJson = json.loads(rsp.text)
+      for e in rspJson["data"]["accounts"]["entities"]:
+        entries.append(e)
+      remaining = len(rspJson["data"]["accounts"]["entities"]) == maxPerPage
+      page += 1
+
+    return entries
+
+  ############################################################################
+
+  def getSites(self, url, headers):
+    """
+    Old Query. Empty response in two real deployments:
+
+    query SitesQuery ($paginator: Paginator) {
+    accounts (paginator: $paginator) {
+      entities {
+        id
+        ip_assignments {
+          entities {
+            ipassignmentable {
+              ...on InventoryItem {
+                parent_inventory_item {
+                  id
+                  inventoryitemable {
+                    ...on NetworkSite {
+                      id
+                      name
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    }
+    
+    Old query, including fields not used:
+
+    query SitesQuery ($paginator: Paginator) {
+      ip_assignments (paginator: $paginator) {
+        entities {
+          subnet
+          ipassignmentable {
+            id
+            ... on InventoryModelFieldData {
+              inventory_item {
+                parent_inventory_item {
+                  id
+                  inventory_model_field_data {
+                    entities {
+                      ip_assignments {
+                        entities {
+                          subnet
+                          description
+                        }
+                      }
+                    }
+                  }
+                }
+                inventoryitemable {
+                  ... on Address {
+                    addressable {
+                      id
+                      ... on Account {
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    page = 1
+    remaining = True
+    maxPerPage = 10000
+    entries = []
+    query = """query SitesQuery ($paginator: Paginator) {
+      ip_assignments (paginator: $paginator) {
+        entities {
+          subnet
+          ipassignmentable {
+            ... on InventoryModelFieldData {
+              inventory_item {
+                parent_inventory_item {
+                  inventory_model_field_data {
+                    entities {
+                      ip_assignments {
+                        entities {
+                          description
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+"""
+  
+    while remaining:
+      self.logger.info("POST to %s, page %d" % (url, page))
+      payload = {
+      "query": query,
+        "variables": {
+          "paginator": {
+            "page": page,
+            "records_per_page": maxPerPage
+          }
+        }
+      }
+      rsp = requests.post(url, headers=headers, data=self.jsonDumps(payload), verify=False)
+      self.printResponseDetails(rsp)
+      if rsp.status_code != 200:
+        raise Exception("Bad query %d (page %d)" % (rsp.status_code, page))
+      rspJson = json.loads(rsp.text)
+      for e in rspJson["data"]["ip_assignments"]["entities"]:
+        # Add only entries with the information we are interested in (with a parent with description)
+        # NOTE: if the query changes, some extra checks may be needed here.
+        if self.fieldIsNotNull(e, ["ipassignmentable", "inventory_item", "parent_inventory_item", "inventory_model_field_data", "entities", "ip_assignments", "entities", "description"]):
+          entries.append(e)
+      remaining = len(rspJson["data"]["ip_assignments"]["entities"]) == maxPerPage
+      page += 1
+
+    return entries
+
+  ############################################################################
+
+  def normalizeData(self, accounts, services, delinquents, sites):
+    data = {'subscribers': [], 'policies': []}
+  
+    for s in services:
+      data["policies"].append({
+        "policyName": "%s-%s" % (s["name"], s["id"]),
+        "policyId": s["id"], # s["name"]
+        "sonarId": s["id"],
+        "rateLimitDownlink": {"rate": int(s["data_service_detail"]["download_speed_kilobits_per_second"])},
+        "rateLimitUplink": {"rate": int(s["data_service_detail"]["upload_speed_kilobits_per_second"])}
+        })
+
+    for a in accounts:
+      if not "ipassignmenthistoryable" in a or \
+          not "account_services" in a["ipassignmenthistoryable"] or \
+          not "entities" in a["ipassignmenthistoryable"]["account_services"]:
+        continue
+      # Get first not null service
+      service = None
+      for s in a["ipassignmenthistoryable"]["account_services"]["entities"]:
+        if s["service"]:
+          service = s["service"]
+          break
+      if not service:
+        self.logger.debug("Account %s without services" % a["ipassignmenthistoryable"]["id"])
+        continue
+      matches = [x for x in data["policies"] if x["sonarId"] == service["id"]]
+      if len(matches) == 1:
+        policy = matches[0]
+      else:
+        self.logger.warning("Service not found (%s)" %  service["id"])
+        continue
+
+      if delinquents == None:
+        blockStatus = a["ipassignmenthistoryable"]["account_status"]["name"] != "Active"
+      else:
+        matches = [x for x in delinquents if x["id"] == a["ipassignmenthistoryable"]["id"]]
+        blockStatus = len(matches) != 0
+        if blockStatus:
+          self.logger.debug("Delinquent blocked %s" % a["ipassignmenthistoryable"]["name"])
+
+      # We assume sites have been filtered so fields of interest always exist
+      subGroups = []
+      foundSites = [x for x in sites if x["subnet"] == a["subnet"]]
+      if len(foundSites) > 0:
+        for site in foundSites:
+          for inventoryField in site["ipassignmentable"]["inventory_item"]["parent_inventory_item"]["inventory_model_field_data"]["entities"]:
+            for ipAssignment in inventoryField["ip_assignments"]["entities"]:
+              if self.fieldIsNotNull(ipAssignment, ["description"]):
+                subGroups.append("L1-" + ipAssignment["description"])
+                self.logger.debug("Subscriber %s %s in group %s" % ( a["ipassignmenthistoryable"]["name"], a["subnet"], ipAssignment["description"]))
+      else:
+        self.logger.debug("Account %s %s in no site" %  (a["ipassignmenthistoryable"]["name"], a["subnet"]))
+      # Remove duplicates
+      subGroups = list(set(subGroups))
+
+      data["subscribers"].append({
+        "subscriberIp": a["subnet"],
+        "subscriberId": a["ipassignmenthistoryable"]["name"],
+        "policyRate" : policy["policyName"],
+        "state": a["ipassignmenthistoryable"]["account_status"]["name"],
+        "block": blockStatus,
+        "subscriberGroups": subGroups
+      })
+
+    return data
+
+################################################################################
+
+if __name__ == "__main__":
+
+  parser = argparse.ArgumentParser(
+    description="""
+  Synchronizes speed limits in Sonar contracts with BQN rate policies.
+
+  Requires an API KEY in Sonar and the REST API enabled in BQN.
+
+  BQN Rate policies are identified by a unique name starting by "SN".
+  BQN subscribers are identified by Sonar client "id".
+  Accounts in status != "Active" have their traffic blocked by BQN (Sonar_block policy).
+
+  Known limitations:
+  - Multiple IP addresses in same contract not supported.
+  - Synchronization may take several minutes.
+  - If the synchronization fails, no retry is attempted (must be don e externally).
+  - No scheduling of script execution (must be done externally).
+  """, formatter_class=argparse.RawTextHelpFormatter)
+
+  parser.add_argument('-b', help='BQN address and REST credentials. If absent, no BQN synchromization',
+                      nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
+  parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
+                    help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('-d', help='If present, blocking govered by delinquency',
+                      dest='delinquent', action="store_true", default=False)
+  parser.add_argument('server', metavar='SERVER', type=str, help="Billing server")
+  parser.add_argument('key', metavar='API-KEY', type=str, help='Billing API key')
+  args = parser.parse_args()
+
+  billingSync = SonarSync(args.verbose)
+
+  url = "https://" + args.server + "/api/graphql"
+  headers = {
+   "Authorization": "Bearer %s" % args.key,
+   "Content-Type": "application/json",
+   "Accept-Encoding": "chunked",
+   "Connection": "keep-alive"
+  }
+
+  accounts = billingSync.getAccounts(url, headers)
+  services = billingSync.getServices(url, headers)
+  if args.delinquent:
+    delinquents = billingSync.getDelinquents(url, headers)
+  else:
+    delinquents = None
+  sites = billingSync.getSites(url, headers)
+  
+  data = billingSync.normalizeData(accounts, services, delinquents, sites)
+  billingSync.printData(data)
+  if args.bqn:
+    billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
+
