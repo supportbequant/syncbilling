@@ -17,6 +17,7 @@
 import json
 import argparse
 import json
+import datetime
 
 import requests
 if not requests.__version__.startswith("1."):
@@ -140,6 +141,8 @@ if __name__ == "__main__":
 
   billingSync = AzotelSync(args.verbose)
 
+  billingSync.logger.warning("%s synchronization script starts (v1.6)" % datetime.datetime.now())
+
   #customers = billingSync.getEntries(args.server, args.user, args.password, "/listCustomerBucketData",
   #                                   bodyParams={"allcustomers": "1", "includenobucket": "1"})
   customers = billingSync.getEntries(args.server, args.user, args.password, "/listCustomerBucketData")  # Returns only client with IP and limits
@@ -150,6 +153,7 @@ if __name__ == "__main__":
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
 
+  billingSync.logger.warning("%s synchronization script ends" % datetime.datetime.now())
 
 
 

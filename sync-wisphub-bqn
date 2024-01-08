@@ -16,6 +16,7 @@
 
 import json
 import argparse
+import datetime
 
 import requests
 if not requests.__version__.startswith("1."):
@@ -109,6 +110,8 @@ if __name__ == "__main__":
 
   billingSync = WisphubSync(args.verbose)
 
+  billingSync.logger.warning("%s synchronization script starts (v1.6)" % datetime.datetime.now())
+
   clients = billingSync.getEntries(args.server, args.key, '/clientes')
 
   data = billingSync.normalizeData(clients)
@@ -116,10 +119,4 @@ if __name__ == "__main__":
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
 
-
-
-
-
-
-
-
+  billingSync.logger.warning("%s synchronization script ends" % datetime.datetime.now())

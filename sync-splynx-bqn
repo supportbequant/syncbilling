@@ -17,6 +17,7 @@
 import json
 import argparse
 import base64
+import datetime
 
 import requests
 if not requests.__version__.startswith("1."):
@@ -109,6 +110,8 @@ if __name__ == "__main__":
 
   billingSync = SplynxSync(args.verbose)
 
+  billingSync.logger.warning("%s synchronization script starts (v1.6)" % datetime.datetime.now())
+
   url = "https://" + args.server + "/api/2.0/admin"
   credentials = base64.b64encode((args.key + ":" + args.secret).encode("utf-8")).decode("utf-8")
   headers = {
@@ -124,6 +127,4 @@ if __name__ == "__main__":
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
 
-
-
-
+  billingSync.logger.warning("%s synchronization script ends" % datetime.datetime.now())

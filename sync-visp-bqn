@@ -16,6 +16,7 @@
 
 import json
 import argparse
+import datetime
 
 import requests
 if not requests.__version__.startswith("1."):
@@ -350,6 +351,8 @@ if __name__ == "__main__":
 
   billingSync = VispSync(args.verbose)
 
+  billingSync.logger.warning("%s synchronization script starts (v1.6)" % datetime.datetime.now())
+
   key = billingSync.generateKey(args.server, args.client, args.secret, args.user, args.password)
 
   customers = billingSync.getCustomerEntries(args.server, key)
@@ -361,6 +364,4 @@ if __name__ == "__main__":
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
 
-
-
-
+  billingSync.logger.warning("%s synchronization script ends" % datetime.datetime.now())
