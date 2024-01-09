@@ -33,10 +33,10 @@ class VispSync(BillingSync):
 
   ############################################################################
 
-  def getEntries(self, server, key, query):
+  def getEntries(self, server, token, query):
     url = "https://" + server + "/graphql"
     headers = {
-   "authorization": "%s" % key,
+   "authorization": "%s" % token,
    "Content-Type": "application/json",
    "Accept-Encoding": "chunked"
   }
@@ -57,9 +57,9 @@ class VispSync(BillingSync):
     else:
       return None
 
-  def getCustomerEntries(self, server, key):
+  def getCustomerEntries(self, server, token):
     query = """
-    customers (status:[1,2,4,8,9]) {
+    customers (status:[1,2,4,8,9,10]) {
       customer_id
       first_name
       last_name
@@ -139,13 +139,13 @@ class VispSync(BillingSync):
       }
     }
 """
-    rsp = self.getEntries(server, key, query)
+    rsp = self.getEntries(server, token, query)
     if rsp:
       return rsp["customers"]
     else:
       return None
 
-  def getServiceEntries(self, server, key):
+  def getServiceEntries(self, server, token):
     query = """
 serviceList {
     service_id
@@ -155,17 +155,17 @@ serviceList {
     default_techcode
   }
 """
-    rsp = self.getEntries(server, key, query)
+    rsp = self.getEntries(server, token, query)
     if rsp:
       return rsp["serviceList"]
     else:
       return None
 
-  def getCpeEntries(self, server, key):
+  def getCpeEntries(self, server, token):
     query = """
 customerCPEwithWirelessServiceSpeeds
 """
-    rsp = self.getEntries(server, key, query)
+    rsp = self.getEntries(server, token, query)
     if rsp:
       return rsp["customerCPEwithWirelessServiceSpeeds"]
     else:
@@ -295,7 +295,7 @@ customerCPEwithWirelessServiceSpeeds
 
   ############################################################################
 
-  def generateKey(self, server, client, secret, user, password):
+  def generateToken(self, server, client, secret, user, password):
     url = "https://" + server + "/token"
     headers = {
    "x-visp-client-id": client,
@@ -342,6 +342,8 @@ if __name__ == "__main__":
                       nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
   parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
                     help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('-t', '--token', type=str, dest='token', default=None,
+                    help="VISP API Token")
   parser.add_argument('server', metavar='VP-SERVER', type=str, help='Billing REST server')
   parser.add_argument('client', metavar='VP-CLIENT', type=str, help='Billing REST client')
   parser.add_argument('secret', metavar='VP-SECRET', type=str, help='Billing REST secret')
@@ -353,11 +355,14 @@ if __name__ == "__main__":
 
   billingSync.logger.warning("%s synchronization script starts (v1.6)" % datetime.datetime.now())
 
-  key = billingSync.generateKey(args.server, args.client, args.secret, args.user, args.password)
-
-  customers = billingSync.getCustomerEntries(args.server, key)
-  #services = billingSync.getServiceEntries(args.server, key)
-  cpes = billingSync.getCpeEntries(args.server, key)
+  if not args.token:
+    token = billingSync.generateToken(args.server, args.client, args.secret, args.user, args.password)
+  else:
+    token = args.token
+  
+  customers = billingSync.getCustomerEntries(args.server, token)
+  #services = billingSync.getServiceEntries(args.server, token)
+  cpes = billingSync.getCpeEntries(args.server, token)
 
   data = billingSync.normalizeData(customers, cpes)
   billingSync.printData(data)
