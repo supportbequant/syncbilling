@@ -17,6 +17,7 @@
 import json
 import argparse
 import datetime
+import sys
 
 import requests
 if not requests.__version__.startswith("1."):
@@ -221,14 +222,14 @@ customerCPEwithWirelessServiceSpeeds
       rsp = "Hibern"
     elif cltStatus == 10:
       rsp = "Inact"
-    elif cltStatus == 20:
+    elif cltStatus == 20:  # It is not queried, so it should not be seen
       rsp = "Deltd"
     else:
       rsp ="Unknown"
     rsp += "-%s-%s" % (pktStatus[:6], srvStatus[:6])
     return rsp
 
-  def normalizeData(self, customers, cpes):
+  def normalizeData(self, customers, cpes, blockBySubStatus):
     data = {'subscribers': [], 'policies': []}
 
     for cust in customers:
@@ -283,11 +284,15 @@ customerCPEwithWirelessServiceSpeeds
                         "burstThresholdWindow": 300
                     }
                 })
+            if blockBySubStatus:
+              blocked = cust["status"] == 8 or cust["status"] == 9 or cust["status"] == 10 
+            else:
+              blocked = pkt["status"] != "ACTIVE" and si["status"] != "ACTIVE"
             data["subscribers"].append({
                 "subscriberIp": ip,
                 "subscriberId": cust["username"],
                 "policyRate" : polName,
-                "block": pkt["status"] != "ACTIVE" and si["status"] != "ACTIVE",
+                "block": blocked,
                 "state": self.getStatus(cust["status"], pkt["status"], si["status"]),
                 "subscriberGroups": subGroups
             })
@@ -342,29 +347,30 @@ if __name__ == "__main__":
                       nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
   parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
                     help="Display extra informationt (repeat for increased verbosity)")
-  parser.add_argument('-t', '--token', type=str, dest='token', default=None,
-                    help="VISP API Token")
+  parser.add_argument('-bss', '--blockBySubStatus', action='store_true', dest="blockBySubStatus", default=False,
+                      help='If True, block by subscriber status. False by default (block by package and service instance status)')
+  parser.add_argument('-t', '--token', type=str, dest='token', default=None, help="VISP API Token")
+  parser.add_argument('-c', help='VISP credentials, in case no API token provided.',
+                      nargs=4, metavar=('VP-CLIENT', 'VP-SECRET', 'VP-USER', 'VP-PASSWORD'), dest='vispAcct')
   parser.add_argument('server', metavar='VP-SERVER', type=str, help='Billing REST server')
-  parser.add_argument('client', metavar='VP-CLIENT', type=str, help='Billing REST client')
-  parser.add_argument('secret', metavar='VP-SECRET', type=str, help='Billing REST secret')
-  parser.add_argument('user', metavar='VP-USER', type=str, help='Billing REST user')
-  parser.add_argument('password', metavar='VP-PASSWORD', type=str, help='Billing REST password')
   args = parser.parse_args()
 
   billingSync = VispSync(args.verbose)
 
   billingSync.logger.warning("%s synchronization script starts (v1.6)" % datetime.datetime.now())
 
-  if not args.token:
-    token = billingSync.generateToken(args.server, args.client, args.secret, args.user, args.password)
-  else:
+  if args.token:
     token = args.token
-  
+  elif args.vispAcct:
+    token = billingSync.generateToken(args.server, args.vispAcct[0], args.vispAcct[1], args.vispAcct[2], args.vispAcct[3])
+  else:
+    billingSync.logger.error("Either -t or -c options must be provided")
+    sys.exit(1)
+
   customers = billingSync.getCustomerEntries(args.server, token)
-  #services = billingSync.getServiceEntries(args.server, token)
   cpes = billingSync.getCpeEntries(args.server, token)
 
-  data = billingSync.normalizeData(customers, cpes)
+  data = billingSync.normalizeData(customers, cpes, args.blockBySubStatus)
   billingSync.printData(data)
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
