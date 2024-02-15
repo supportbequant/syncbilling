@@ -65,6 +65,8 @@ class WisphubSync(BillingSync):
   def normalizeData(self, clients):
     data = {'subscribers': [], 'policies': []}
     for c in clients:
+      if c["estado"] == "Cancelado":
+        continue
       policyName = c["plan_internet"]["nombre"]
       data["subscribers"].append({
         "subscriberIp": c["ip"],
@@ -73,7 +75,7 @@ class WisphubSync(BillingSync):
         "block": c["estado"] == "Suspendido",
         "state": c["estado"]
       })
-      # No policies created (no rates known in wisphub query)
+    # No policies created (no rates known in wisphub query).
     return data
 
 ################################################################################

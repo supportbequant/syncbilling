@@ -74,6 +74,10 @@ class WisproSync(BillingSync):
         "rateLimitUplink": {"rate": int(p["ceil_up_kbps"])}
         })
     for c in contracts:
+      # If duplicated IP, ignore and warn
+      if len( [x for x in data["subscribers"] if x["subscriberIp"] == c["ip"]] ) > 0:
+        self.logger.warning("Contract with a duplicated IP %s ignored (client id %s)" % (c["ip"], c["client_id"]))
+        continue
       if c["netmask"] != "255.255.255.255":
         self.logger.warning("Contract with multiple IPs not supported (%s, mask %s)" % (c["ip"], c["netmask"]))
         continue

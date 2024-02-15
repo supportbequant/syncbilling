@@ -61,13 +61,14 @@ class AzotelSync(BillingSync):
 
   def obtainSiteEquipments(self, sites):
     equipments = []
-    for site in sites["siteData"]:
-      for equipment in site["equipment"]:
-        equipments.append({
-          "sitename": site["sitename"],
-          "nickname": equipment["nickname"],
-          "equipid": equipment["equipid"]
-        })
+    if sites and "siteData" in sites:
+      for site in sites["siteData"]:
+        for equipment in site["equipment"]:
+          equipments.append({
+            "sitename": site["sitename"],
+            "nickname": equipment["nickname"],
+            "equipid": equipment["equipid"]
+          })
     return equipments
 
   def normalizeData(self, customers, cpes, sites):
@@ -98,6 +99,10 @@ class AzotelSync(BillingSync):
       # Remove duplicates
       subGroups = list(set(subGroups))
       for ip in c["ipaddresses"]:
+        # If duplicated IP, ignore and warn
+        if len( [x for x in data["subscribers"] if x["subscriberIp"] == ip["ip"]] ) > 0:
+          self.logger.warning("Service with a duplicated IP %s ignored (customer %s)" % (ip["ip"], c["name"]))
+          continue
         data["subscribers"].append({
           "subscriberIp": ip["ip"],
           "subscriberId": c["name"],

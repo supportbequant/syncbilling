@@ -263,6 +263,10 @@ customerCPEwithWirelessServiceSpeeds
           # Remove duplicates by converting to a dictionary and back to a list
           ips = list(dict.fromkeys(ips))
           for ip in ips:
+            # If duplicated IP, ignore and warn
+            if len( [x for x in data["subscribers"] if x["subscriberIp"] == ip] ) > 0:
+              self.logger.warning("Service with a duplicated IP %s ignored (customer %s)" % (ip, cust["username"]))
+              continue
             polName = self.getPolicyName(upRate, dnRate, upBustRate, dnBustRate, srv['burst_seconds'])
             foundPolicies = [ x for x in data["policies"] if x["policyName"] == polName]
             if len(foundPolicies) == 0:
