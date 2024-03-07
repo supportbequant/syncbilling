@@ -4,19 +4,19 @@ Simple synchronization script between BQN and a billing system.
 
 ## Installation
 
-The script requires python 3.10 or later with *requests* package version 2.28.1 (does not work with newer versions).
+The script requires python 3.6 or later with *requests* package (tested with version 2.27.1 and 2.31.0, it may not wotk with newer versions).
 
 ### In Ubuntu Linux:
 `$ sudo app install python3`
 
 `$ sudo app install pip`
 
-`$ sudo pip3 install requests==2.28.1`
+`$ sudo pip3 install requests`
 
 ### In Arch Linux:
 `$ sudo pacman -S python3`
 
-`$ sudo pip3 install requests==2.28.`
+`$ sudo pip3 install requests`
 
 ### In Windows:
 1. In elevated (administration) shell:
@@ -25,7 +25,7 @@ The script requires python 3.10 or later with *requests* package version 2.28.1 
 
 2. In normal shell:
 
-`> pip install requests==2.28.`
+`> pip install requests`
 
 #### In Mac OS:
 1. Download package for Mac from python official site:
@@ -36,7 +36,7 @@ https://www.python.org/downloads/macos/
 
 4. In command shell:
 
-`$ pip3 install requests==2.28.`
+`$ pip3 install requests`
 
 ## Setup
 
