@@ -4,7 +4,7 @@ Simple synchronization script between BQN and a billing system.
 
 ## Installation
 
-The script requires python 3.6 or later with *requests* package (tested with version 2.27.1 and 2.31.0, it may not wotk with newer versions).
+The script requires python 3.6 or later with *requests* package (tested with version 2.27.1 and 2.31.0, it may not work with newer versions).
 
 ### In Ubuntu Linux:
 `$ sudo app install python3`
