@@ -122,6 +122,8 @@ if __name__ == "__main__":
   }
   tariffs = billingSync.getEntries(args.server, args.key, args.secret, '/tariffs/internet')
   customers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customers-online')
+
+
   data = billingSync.normalizeData(tariffs, customers)
   billingSync.printData(data)
   if args.bqn:

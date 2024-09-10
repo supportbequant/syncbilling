@@ -16,9 +16,9 @@
 
 import json
 import logging
+import logging.handlers
 import sys
 import datetime
-import os
 import platform
 
 import requests
@@ -64,16 +64,21 @@ class BillingSync:
 
   ############################################################################
 
-  def __init__(self, verbose):
+  def __init__(self, verbose, logFile=None):
     self.logger = logging.getLogger(__name__)
-    if verbose == 0:
-      self.logger.setLevel(logging.WARNING)
-    elif verbose == 1:
-      self.logger.setLevel(logging.INFO)
+    logLevel = logging.WARNING
+    if verbose == 1:
+      logLevel = logging.INFO
+    elif verbose > 1:
+      logLevel = logging.DEBUG
+    if logFile:
+      logging.basicConfig(
+                    format='%(message)s',
+                    level=logLevel,
+                    handlers=[logging.handlers.RotatingFileHandler(logFile, maxBytes=5*10**8, backupCount=10)]
+      )
     else:
-      self.logger.setLevel(logging.DEBUG)
-    #logging.basicConfig(stream=sys.stdout, format='%(asctime)s %(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
-    logging.basicConfig(stream=sys.stdout, format='%(message)s')
+      logging.basicConfig(stream=sys.stdout, format='%(message)s', level=logLevel)
 
   ############################################################################
 
@@ -161,23 +166,62 @@ class BillingSync:
 
   ############################################################################
 
-  def printSubscriberPolicies(self, data):
+  def printPolicies(self, data):
+    if not data or not "policies" in data or len(data["policies"]) == 0:
+      self.logger.debug("No policies to print")
+      return
+
     # Calculate size of columns as maximum length of the values to display
     # When the column header may be wider than the displayed values, it is
     # also considered.
     # We create a list with the dictionary field values for each column, get the
     # list item with the maximum length and finally get that length.
     tableSizes = []
+    tableSizes.append( len( max(list(x["policyName"] for x in data["policies"]) + ["Policy"], key=len) ) )
+    tableSizes.append( len( max(list(str(x["policyId"]) for x in data["policies"] if "policyId" in x) + ["Policy-Id"], key=len) ) )
+    tableSizes.append( len( max(list(str(x["rateLimitDownlink"]["rate"]) for x in data["policies"] if "rateLimitDownlink" in x) + ["Dn-Kbps"], key=len) ) )
+    tableSizes.append( len( max(list(str(x["rateLimitUplink"]["rate"]) for x in data["policies"] if "rateLimitUplink" in x) + ["Up-Kbps"], key=len) ) )
+
+    rowFormat = ''
+    for size in tableSizes:
+      rowFormat += "{:<%d}" % (size + 1)
+    self.logger.info("\nPOLICIES\n" + rowFormat.format("Policy"
+                                      ,"Policy-Id"
+                                      ,"Dn-Kbps"
+                                      ,"Up-Kbps"
+                                      ))
+
+  
+    for p in data["policies"]:
+      policyId = "n/a"
+      rateLimitDownlink = "n/a"
+      rateLimitUplink = "n/a"
+
+      if "policyId" in p:
+        policyId = p["policyId"]
+      if "rateLimitDownlink" in p:
+        rateLimitDownlink = p["rateLimitDownlink"]["rate"]
+      if "rateLimitUplink" in p:
+        rateLimitUplink = p["rateLimitUplink"]["rate"]
+
+      self.logger.info(rowFormat.format(p["policyName"]
+                                        ,policyId
+                                        ,rateLimitDownlink
+                                        ,rateLimitUplink
+                                        ))
+
+
+  ############################################################################
+
+  def printSubscribers(self, data):
+    if not data or not "subscribers" in data or len(data["subscribers"]) == 0:
+      self.logger.debug("No subscribers to print")
+      return
+
+    # Similar calculation of format as in print Policies
+    tableSizes = []
     tableSizes.append( len( max(list(x["subscriberIp"] for x in data["subscribers"]), key=len) ) )
-    tableSizes.append( len( max(list(x["policyRate"] for x in data["subscribers"]), key=len) ) )
-    if len(data["policies"]) > 0:
-      tableSizes.append( len( max(list(str(x["policyId"]) for x in data["policies"] if "policyId" in x), key=len) ) )
-      tableSizes.append( len( max(list(str(x["rateLimitDownlink"]["rate"]) for x in data["policies"] if "rateLimitDownlink" in x) + ["Dn Kbps"], key=len) ) )
-      tableSizes.append( len( max(list(str(x["rateLimitUplink"]["rate"]) for x in data["policies"] if "rateLimitUplink" in x) + ["Up Kbps"], key=len) ) )
-    else: # No policies defined, policy Id n/a
-      tableSizes.append( len( "Plan Id") )
-      tableSizes.append( len( "Dn Kbps" ) )
-      tableSizes.append( len( "Up Kbps" ) )
+    tableSizes.append( len( max(list(x["policyRate"] for x in data["subscribers"] if "policyRate" in x) + ["Policy"], key=len) ) )
     tableSizes.append( max(len( max(list(str(x["state"]) for x in data["subscribers"]), key=len) ), len("state") ) )
     tableSizes.append( len("Block") )
     tableSizes.append( len( max(list(str(x["subscriberId"]) for x in data["subscribers"] if "subscriberId" in x), key=len) ) )
@@ -185,67 +229,70 @@ class BillingSync:
     rowFormat = ''
     for size in tableSizes:
       rowFormat += "{:<%d}" % (size + 1)
-    self.logger.info("\n" + rowFormat.format("IP"
-                                      ,"Plan"
-                                      ,"Plan Id"
-                                      ,"Dn Kbps"
-                                      ,"Up Kbs"
+    self.logger.info("\nSUBSCRIBERS\n" + rowFormat.format("IP"
+                                      ,"Policy"
                                       ,"State"
                                       ,"Block"
                                       ,"Name"))
 
   
     for s in data["subscribers"]:
-      matches = [x for x in data["policies"] if x["policyName"] == s["policyRate"]]
-      if len(matches) == 1:
-        policy = matches[0]
-      else:
-        self.logger.debug("Policy %s not found" % s["policyRate"])
-        # Some billing do not return policy details (e.g. wisphub)
-        policy ={
-            "policyName": s["policyRate"],
-            "policyId": 0
-        }
+      subscriberId = "n/a"
+      block = "n/a"
+      state = "n/a"
+      policyName = "n/a"
+
+      if "subscriberId" in s:
+        subscriberId = s["subscriberId"]
+      if "state" in s:
+        state = s["state"]
+      if "block" in s:
+        block ="yes" if s["block"] else "no"
+      if "policyRate" in s:
+        policyName =  s["policyRate"]
+
       self.logger.info(rowFormat.format(s["subscriberIp"]
-                                        ,policy["policyName"]
-                                        ,policy["policyId"] if "policyId" in policy else "n/a"
-                                        ,policy["rateLimitDownlink"]["rate"] if "rateLimitDownlink" in policy else "n/a"
-                                        ,policy["rateLimitUplink"]["rate"] if "rateLimitUplink" in policy else "n/a"
-                                        ,s["state"]
-                                        ,"yes" if s["block"] else "no"
-                                        ,s["subscriberId"] if "subscriberId" in s else "n/a"))
+                                        ,policyName
+                                        ,state
+                                        ,block
+                                        ,subscriberId))
 
   ############################################################################
 
   def printSubscriberGroups(self, data):
-    # Calculate size of columns as maximum length of the values to display
-    # Subscriber groups have no size limit (at the end of the table)
- 
+    if not data or not "subscriberGroups" in data or len(data["subscriberGroups"]) == 0:
+      self.logger.debug("No subscriber groups to print")
+      return
+
+    # Similar calculation of format as in print Policies
     tableSizes = []
-    tableSizes.append( len( max(list(x["subscriberIp"] for x in data["subscribers"]), key=len) ) )
-    tableSizes.append( len( max(list(str(x["subscriberId"]) for x in data["subscribers"]), key=len) ) )
+    tableSizes.append( len( max(list(x["subscriberGroupName"] for x in data["subscriberGroups"]) + ["Group"], key=len) ) )
+    tableSizes.append( len( max(list(x["policyRate"] for x in data["subscriberGroups"] if "policyRate" in x) + ["Policy"], key=len) ) )
+    tableSizes.append( 48 ) #  maximum length of a IPv6 address
 
     rowFormat = ''
     for size in tableSizes:
       rowFormat += "{:<%d}" % (size + 1)
-    self.logger.info("\n" + rowFormat.format("IP"
-                                      ,"Name") + " Groups")
+    self.logger.info("\nSUBSCRIBER GROUPS\n" + rowFormat.format("Group", "Policy", "Member-IP/Range"))
 
-    for s in data["subscribers"]:
-      if not "subscriberGroups" in s:
-        continue
-      subGroups = ""
-      for group in s["subscriberGroups"]:
-        subGroups += " %s" % group
-      if len(subGroups) > 0:
-        self.logger.info(rowFormat.format(s["subscriberIp"]
-                                         ,s["subscriberId"]) + subGroups)
-
+    for sg in data["subscriberGroups"]:
+      policyRate = sg["policyRate"] if "policyRate" in sg else "n/a"
+      if "subscriberMembers" in sg:
+        for ip in sg["subscriberMembers"]:
+          self.logger.info(rowFormat.format(sg["subscriberGroupName"],
+                                          policyRate,
+                                          str(ip)))
+      if "subscriberRanges" in sg:
+        for ip in sg["subscriberRanges"]:
+          self.logger.info(rowFormat.format(sg["subscriberGroupName"],
+                                          policyRate,
+                                          str(ip)))
 
   ############################################################################
 
   def printData(self, data):
-    self.printSubscriberPolicies(data)
+    self.printPolicies(data)
+    self.printSubscribers(data)
     self.printSubscriberGroups(data)
 
   ############################################################################
@@ -281,6 +328,169 @@ class BillingSync:
 
   ############################################################################
 
+  def bqnApiRest(self, session, method, uri, id, entry=None):
+    safeId = requests.utils.quote(id, safe='')  # Empty safe char list, so / is not regarded as safe and encoded as well
+
+    if method == 'post':
+      rsp = session.post(uri + safeId, data=self.jsonDumps(entry))
+      self.printResponseDetails(rsp)
+    elif method == 'put':
+      rsp = session.put(uri + safeId, data=self.jsonDumps(entry))
+      self.printResponseDetails(rsp)
+    elif method == 'get':
+      rsp = session.get(uri + safeId)
+      self.printResponseDetails(rsp)
+    elif method == 'delete':
+      rsp = session.delete(uri + safeId)
+      self.printResponseDetails(rsp)
+    else:
+      self.logger.debug("Unknown BQN API REST method %s" % method)
+  
+  ############################################################################
+
+  def updateBqnPolicies(self, uriRoot, session, data):
+    creations = 0
+    modifications = 0
+    deletions = 0
+    polsInBqn = {}
+
+    if not "policies" in data or len(data["policies"]) == 0:
+      self.logger.debug("No policy information to update")
+      return
+
+    rsp = session.get(uriRoot + "/policies/rate")
+    if rsp.status_code == 200:
+      for p in rsp.json()["items"]:
+        polsInBqn[p["policyName"]] = {"policy": p, "inBilling": False}
+
+    self.logger.info("%s start synchronization of policies into %s" % (datetime.datetime.now(), uriRoot))
+    for p in data["policies"]:
+      if not p["policyName"] in polsInBqn:
+        self.logger.debug("Create policy %s" % p["policyId"])
+        self.bqnApiRest(session, 'post', uriRoot + "/policies/rate/", p["policyName"], p)
+        polsInBqn[p["policyName"]] = {"policy": p, "inBilling": True}
+        creations += 1
+      else:
+        match = polsInBqn[p["policyName"]]["policy"]
+        polsInBqn[p["policyName"]]["inBilling"] = True
+        if not self.areEqual(match, p, ["policyId", "rateLimitDownlink", "rateLimitUplink"]):
+          self.logger.debug("Policy changed. In BQN: %s" % match)
+          self.logger.debug("            In Billing: %s" % p)
+          self.logger.debug("Modify policy %s" % p["policyName"])
+          self.bqnApiRest(session, 'post', uriRoot + "/policies/rate/", p["policyName"], p)
+          modifications += 1
+
+    # Generate a block policy to enforce inactive clients
+    if not BillingSync.BLOCK_POLICY in polsInBqn:
+      payload = self.jsonDumps({"policyId": "block", "rateLimitDownlink": {"rate": 0}, "rateLimitUplink": {"rate": 0}})
+      rsp = session.post(uriRoot + "/policies/rate/" + BillingSync.BLOCK_POLICY, data=payload)
+      self.printResponseDetails(rsp)
+
+    # Delete policies no longer in billing (except blocking)
+    for key in polsInBqn:
+      if key != BillingSync.BLOCK_POLICY and not polsInBqn[key]["inBilling"]:
+        self.bqnApiRest(session, 'delete', uriRoot + "/policies/rate/", key)
+        deletions += 1
+
+    self.logger.warning("%s policy synchronization: %d created, %d updated and %d deleted" % \
+                        (datetime.datetime.now(), creations, modifications, deletions))
+
+  ############################################################################
+
+  def updateBqnSubscribers(self, uriRoot, session, data):
+    creations = 0
+    modifications = 0
+    deletions = 0
+    subsInBqn = {}
+
+    if not "subscribers" in data or len(data["subscribers"]) == 0:
+      self.logger.debug("No subscriber information to update")
+      return
+
+    rsp = session.get(uriRoot + "/subscribers")
+    if rsp.status_code == 200:
+      for s in rsp.json()["items"]:
+        subsInBqn[s["subscriberIp"]] = {"subscriber": s, "inBilling": False}
+
+    self.logger.info("%s start synchronization of subscribers into %s" % (datetime.datetime.now(), uriRoot))
+    for s in data["subscribers"]:
+      if not s["subscriberIp"] in subsInBqn:
+        self.logger.debug("Create subscriber %s" % s["subscriberIp"])
+        self.bqnApiRest(session, 'post', uriRoot + "/subscribers/", s["subscriberIp"], s)
+        subsInBqn[s["subscriberIp"]] = {"subscriber": s, "inBilling": True}
+        creations += 1
+      else:
+        match = subsInBqn[s["subscriberIp"]]["subscriber"]
+        subsInBqn[s["subscriberIp"]]["inBilling"] = True        
+        # If no policy in billing and assigned by rules in BQN, no update of policy needed
+        if not s["policyRate"] and "policyAssignedBy" in match and match["policyAssignedBy"] == 'rules':
+          if not self.areEqual(match, s, ["subscriberId"]):
+            self.logger.debug("Subscriber changed. In BQN: %s" % match)
+            self.logger.debug("                In Billing: %s" % s)
+            self.logger.debug("Modify ID of subscriber %s" % s["subscriberIp"])
+            self.bqnApiRest(session, 'post', uriRoot + "/subscribers/", s["subscriberIp"], s)
+            modifications += 1
+        elif not self.areEqual(match, s, ["subscriberId", "policyRate"]):
+          self.logger.debug("Subscriber changed. In BQN: %s" % match)
+          self.logger.debug("                In Billing: %s" % s)
+          self.logger.debug("Modify subscriber %s" % s["subscriberIp"])
+          self.bqnApiRest(session, 'post', uriRoot + "/subscribers/", s["subscriberIp"], s)
+          modifications += 1
+
+    # Delete subscribers no longer in billing
+    for key in subsInBqn:
+      if not subsInBqn[key]["inBilling"]:
+        self.bqnApiRest(session, 'delete', uriRoot + "/subscribers/", key)
+        deletions += 1
+
+    self.logger.warning("%s subscriber synchronization: %d created, %d updated and %d deleted" % \
+                        (datetime.datetime.now(), creations, modifications, deletions))
+
+  ############################################################################
+
+  def updateBqnSubscriberGroups(self, uriRoot, session, data):
+    creations = 0
+    modifications = 0
+    deletions = 0
+    sgsInBqn = {}
+
+    if not "subscriberGroups" in data or len(data["subscriberGroups"]) == 0:
+      self.logger.debug("No subscriber group information to update")
+      return
+
+    rsp = session.get(uriRoot + "/subscriberGroups")
+    if rsp.status_code == 200:
+      for sg in rsp.json()["items"]:
+        sgsInBqn[sg["subscriberGroupName"]] = {"group": sg, "inBilling": False}
+
+    self.logger.info("%s start synchronization of subscriber groups into %s" % (datetime.datetime.now(), uriRoot))
+    for sg in data["subscriberGroups"]:
+      if not sg["subscriberGroupName"] in sgsInBqn:
+        self.logger.debug("Create subscriber group %s" % sg["subscriberGroupName"])
+        self.bqnApiRest(session, 'post', uriRoot + "/subscriberGroups/", sg["subscriberGroupName"], sg)
+        sgsInBqn[sg["subscriberGroupName"]] = {"group": sg, "inBilling": True}
+        creations += 1
+      else:
+        match = sgsInBqn[sg["subscriberGroupName"]]["group"]
+        sgsInBqn[sg["subscriberGroupName"]]["inBilling"] = True        
+        if not self.areEqual(match, sg, ["subscriberMembers", "subscriberRanges", "policyRate"]):
+          self.logger.debug("Group changed. In BQN: %s" % match)
+          self.logger.debug("           In Billing: %s" % sg)
+          self.logger.debug("Modify group %s" % sg["subscriberGroupName"])
+          self.bqnApiRest(session, 'post', uriRoot + "/subscriberGroups/", sg["subscriberGroupName"], sg)
+          modifications += 1
+
+    # Delete groups no longer in billing
+    for key in sgsInBqn:
+      if not sgsInBqn[key]["inBilling"]:
+        self.bqnApiRest(session, 'delete', uriRoot + "/subscriberGroups/", key)
+        deletions += 1
+
+    self.logger.warning("%s subscriber group synchronization: %d created, %d updated and %d deleted" % \
+                        (datetime.datetime.now(), creations, modifications, deletions))
+
+  ############################################################################
+
   def updateBqn(self, bqnIp, bqnUser, bqnPassword, data):
 
     uriRoot = "https://" + bqnIp + ":3443/api/v1"
@@ -295,11 +505,8 @@ class BillingSync:
     if int(PY_VERSION[1]) >= 7:  # 3.7 or more
       session.mount(uriRoot, BqnRestAdapter())
 
-    updatedPolicies = 0
-    updatedSubscribers = 0
-
     # Adapt data to BQN format
-    for item in data["policies"] + data["subscribers"]:
+    for item in data["policies"] + data["subscribers"] + data["subscriberGroups"]:
       self.normalize(item)
     # Add fields not treated by billing
     for p in data["policies"]:
@@ -308,53 +515,14 @@ class BillingSync:
     for s in data["subscribers"]:
       if s["block"]:
         s["policyRate"] = BillingSync.BLOCK_POLICY
+      # Remove block/state fields, unknown to BQN and no longer needed
+      del s["block"]        
+      del s["state"]        
 
-    self.logger.info("Create policies is %s" % uriRoot)
-    rsp = session.get(uriRoot + "/policies/rate")
-    polsInBqn = rsp.json()["items"]
-    for p in data["policies"]:
-      matches = [x for x in polsInBqn if x["policyName"] == p["policyName"]]
-      if len(matches) > 0:
-        if len(matches) > 1:
-          self.logger.warning("Policy %s found more than once, taking first one" % p["policyName"])
-        if self.areEqual(matches[0], p, ["policyId", "rateLimitDownlink", "rateLimitUplink"]):
-          continue
-      self.logger.debug("Create policy %s" % p["policyId"])
-      policyName = requests.utils.quote(p["policyName"], safe='')  # Empty safe char list, so / is not regarded as safe and encoded as well
-      payload = self.jsonDumps(p)
-      rsp = session.post(uriRoot + "/policies/rate/" + policyName, data=payload)
-      self.printResponseDetails(rsp)
-      updatedPolicies += 1
-    # Generate a block policy to enforce inactive clients
-    matches = [x for x in polsInBqn if x["policyName"] == BillingSync.BLOCK_POLICY]
-    if len(matches) == 0:
-      payload = self.jsonDumps({"policyId": "block", "rateLimitDownlink": {"rate": 0}, "rateLimitUplink": {"rate": 0}})
-      rsp = session.post(uriRoot + "/policies/rate/" + BillingSync.BLOCK_POLICY, data=payload)
-      self.printResponseDetails(rsp)
-
-    rsp = session.get(uriRoot + "/subscribers")
-    subsInBqn = rsp.json()["items"]
-    self.logger.info("Create subscribers in %s" % uriRoot)
-    for s in data["subscribers"]:
-      matches = [x for x in subsInBqn if x["subscriberIp"] == s["subscriberIp"]]
-      # If more than one match, we take first one
-      if len(matches) > 0:
-        if len(matches) > 1:
-          self.logger.warning("Subscriber %s found in BQN more than once, taking first one" % s["subscriberIp"])
-        if not "all-subscribers" in s["subscriberGroups"]:  # Add all subscribers for exact comparison
-          s["subscriberGroups"].insert(0, "all-subscribers")
-        if self.areEqual(matches[0], s, ["subscriberId", "policyRate", "subscriberGroups"]):
-          continue
-        self.logger.debug("Subscriber changed. In BQN: %s" % matches[0])
-        self.logger.debug("                In billing: %s" % s)
-      self.logger.debug("Create subscriber %s" % s["subscriberIp"])
-      payload = self.jsonDumps(s)
-      rsp = session.post(uriRoot + "/subscribers/" + s["subscriberIp"], data=payload)
-      self.printResponseDetails(rsp) 
-      updatedSubscribers += 1
-
-    self.logger.warning("%s synchronization of %d policies and %d subscribers" % \
-                 (datetime.datetime.now(), updatedPolicies, updatedSubscribers))
+    self.logger.warning("%s synchronization with BQN starts" % datetime.datetime.now())  
+    self.updateBqnPolicies(uriRoot, session, data)
+    self.updateBqnSubscribers(uriRoot, session, data)
+    self.updateBqnSubscriberGroups(uriRoot, session, data)
 
   ################################################################################
 

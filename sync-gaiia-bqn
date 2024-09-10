@@ -1,0 +1,289 @@
+#!/usr/bin/python3
+
+################################################################################
+#
+# Copyright (c) 2022 Bequant S.L.
+# All rights reserved.
+#
+# This product or document is proprietary to and embodies the
+# confidential technology of Bequant S.L., Spain.
+# Possession, use, duplication or distribution of this product
+# or document is authorized only pursuant to a valid written
+# license from Bequant S.L.
+#
+#
+################################################################################
+
+import json
+import argparse
+import datetime
+import time
+import sys
+
+import requests
+if not requests.__version__.startswith("1."):
+  # Avoid insecure warning when issuing REST queries
+  import urllib3
+  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from BillingSync import BillingSync
+
+################################################################################
+
+class Gaiia(BillingSync):
+
+  PAGINATION_PLACEHOLDER = "<PAGINATION-PLACEHOLDER>"
+
+  ############################################################################
+
+  def buildQuery(self, template, after=None):
+    # Template must have PAGINATION_PLACEHOLDER
+    if after:
+      return template.replace(Gaiia.PAGINATION_PLACEHOLDER, "after: \"%s\"" % after)
+    else: # First page
+      return template.replace(Gaiia.PAGINATION_PLACEHOLDER, "")
+      
+  ############################################################################
+
+  def sendPost(self, url, headers, query, variables=None):
+    if variables:
+      data = self.jsonDumps({"query": query, "variables": variables})
+    else:
+      data = self.jsonDumps({"query": query})
+    rsp = requests.post(url, headers=headers, data=data, verify=False)
+    self.printResponseDetails(rsp)
+    if rsp.status_code != 200:
+      raise Exception("Bad query %d" % rsp.status_code)
+    try:
+      jsonResponse = json.loads(rsp.text)
+    except Exception as e:
+      raise Exception("Query response could not be converted to JSON")
+
+    # Check GrapQL errors
+    if "errors" in jsonResponse:
+      for e in jsonResponse["errors"]:
+        # If we hit Gaiia rate limit, wait the indicated time and try again
+        if e["extensions"]["code"] == "RATE_LIMITED":
+          then = datetime.datetime.strptime(e["extensions"]["retryAt"], "%Y-%m-%dT%H:%M:%S.%f%z")
+          # now() must have a timezone set. If it is offset-naive (default), the wait could not be calculated
+          now = datetime.datetime.now(datetime.timezone.utc)
+          wait = (then - now).total_seconds()
+          self.logger.warning("%s RATE_LIMITED, waiting for %.2f seconds to send query again" % (datetime.datetime.now(), wait))
+          if wait > 0:
+            time.sleep(wait)
+          return self.sendPost(url, headers, query, variables)
+        else:
+          raise Exception("Query response with GraphQL error %s" % e["extensions"]["code"])
+
+    return jsonResponse
+
+  ############################################################################
+
+  def getInternetPlans(self, url, headers):
+    # TODO: Ask for INTERNET_PLAN type only
+    queryTemplate = """query Products {
+    products(%s, filter: { category: { type: { equals: INTERNET_PLAN } } } ) {
+      nodes {
+        id
+        name
+        productCategory {
+          type
+        }
+        rawSpecificationValue
+        productVersions {
+          nodes {
+            id
+          }
+        }
+      }
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+    }
+  }""" % Gaiia.PAGINATION_PLACEHOLDER
+    entries = []
+
+    rsp = self.sendPost(url, headers, self.buildQuery(queryTemplate))
+    entries += rsp["data"]["products"]["nodes"]
+
+    while rsp["data"]["products"]["pageInfo"]["hasNextPage"]:
+      nextToken = rsp["data"]["products"]["pageInfo"]["endCursor"]
+      rsp = self.sendPost(url, headers, self.buildQuery(queryTemplate, nextToken))
+      entries += rsp["data"]["products"]["nodes"]
+
+    return entries
+
+  ############################################################################
+
+  def getAccounts(self, url, headers):
+    # TODO: Ask for ACTIVE and SUSPENDED status only (rest without a plan)
+    queryTemplate = """query Accounts {
+    accounts(%s, filter: { status: { type: { in: [ACTIVE, INACTIVE, SUSPENDED] } } } ) {
+      nodes {
+        primaryContact {
+          firstName
+          lastName
+        }
+        status {
+          type
+        }
+        billingSubscriptions {
+          nodes {
+            unassignedAt
+            productVersion {
+              product {
+                name
+                productCategory {
+                  type
+                }
+              }
+            }
+          }
+        }
+        assignedInventoryItems {
+          nodes {
+            inventoryItem {
+              id
+              ipAddressV4
+              ipAddressV6
+            }
+          }
+        }
+      }
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+    }
+  }""" % Gaiia.PAGINATION_PLACEHOLDER
+    entries = []
+
+    rsp = self.sendPost(url, headers, self.buildQuery(queryTemplate))
+    entries += rsp["data"]["accounts"]["nodes"]
+ 
+    while rsp["data"]["accounts"]["pageInfo"]["hasNextPage"]:
+      nextToken = rsp["data"]["accounts"]["pageInfo"]["endCursor"]
+      rsp = self.sendPost(url, headers, self.buildQuery(queryTemplate, nextToken))
+      entries += rsp["data"]["accounts"]["nodes"]
+
+    return entries
+
+  ############################################################################
+
+  def getInternetProductSubscription(self, subscriptions): 
+    return [ x["productVersion"]["product"]["name"] for x in subscriptions 
+                if not x["unassignedAt"] and \
+                   x["productVersion"]["product"]["productCategory"]["type"] == "INTERNET_PLAN" ]
+      
+  def normalizeData(self, products, accounts, dualStack):
+    data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
+  
+    # product name is unique in Gaiia
+    for p in products:
+      data["policies"].append({
+          "policyName": p["name"],
+          "policyId": p["id"],
+          "rateLimitUplink": {"rate": p["rawSpecificationValue"]["uploadSpeedInKbps"]},
+          "rateLimitDownlink": {"rate": p["rawSpecificationValue"]["downloadSpeedInKbps"]}
+      })
+
+    for a in accounts:
+      subscriberId = a["primaryContact"]["firstName"] + " " + a["primaryContact"]["lastName"]
+      matches = self.getInternetProductSubscription(a["billingSubscriptions"]["nodes"])
+      if len(matches) == 0:
+        self.logger.warning("%s without a policy, ignored" % subscriberId)
+        continue
+      elif len(matches) > 1:
+        self.logger.warning("%s with more than one policy, ignored" % subscriberId)
+        continue
+      else:
+        policy = matches[0]
+      block =  a["status"]["type"] == "INACTIVE" or a["status"]["type"] == "SUSPENDED"  # ACTIVE not blocked
+      for item in a["assignedInventoryItems"]["nodes"]:
+        if item["inventoryItem"]["ipAddressV4"]:
+          data["subscribers"].append({
+              "subscriberIp": item["inventoryItem"]["ipAddressV4"],
+              "subscriberId": subscriberId,
+              "policyRate" : policy,
+              "state": a["status"]["type"],
+              "block": block
+            })
+        if item["inventoryItem"]["ipAddressV6"]:
+          data["subscribers"].append({
+              "subscriberIp": item["inventoryItem"]["ipAddressV6"],
+              "subscriberId": subscriberId,
+              "policyRate" : policy,
+              "state": a["status"]["type"],
+              "block": block
+            })
+        if dualStack and item["inventoryItem"]["ipAddressV4"] and item["inventoryItem"]["ipAddressV6"]:
+          # Define a Subscriber Group with all IP addresses
+          subGroup = {}
+          subGroup["subscriberGroupName"] = "DS-%s" % subscriberId
+          subGroup["policyRate"] = policy
+          subGroup["subscriberMembers"] = [item["inventoryItem"]["ipAddressV4"]]
+          subGroup["subscriberRanges"] = [item["inventoryItem"]["ipAddressV6"]]
+          data["subscriberGroups"].append(subGroup)
+
+    return data
+
+################################################################################
+
+if __name__ == "__main__":
+
+  parser = argparse.ArgumentParser(
+    description="""
+  Synchronizes speed limits in Gaiia with BQN rate policies.
+
+  Requires an API KEY in Gaiia and the REST API enabled in BQN.
+
+  BQN Rate policies are identified by XXXXXX.
+  BQN subscribers are identified by XXXXX.
+  Accounts in status != "Active" have their traffic blocked by BQN.
+
+  Known limitations:
+  - Multiple IP addresses in same contract not supported.
+  - Synchronization may take several minutes.
+  - If the synchronization fails, no retry is attempted (must be don e externally).
+  - No scheduling of script execution (must be done externally).
+  """, formatter_class=argparse.RawTextHelpFormatter)
+
+  parser.add_argument('-b', help='BQN address and REST credentials. If absent, no BQN synchronization',
+                      nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
+  parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
+                    help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('-lf', '--log-file', default=None, type=str, dest="logFile",
+      help='Log file to use. If absent, logs go to the standard output')
+  parser.add_argument('-ds', '--dual-stack', action='store_true', dest="dualStack", default=False, 
+      help='Group v4 and v6 IP addresses of same subscriber under same rate limit. Requires BQN R4.22 or later. If absent, no group created')
+  parser.add_argument('-s', '-server', dest="server", type=str, default="api.gaiia.com",
+      help='Billing server (default api.gaiia.com')
+  parser.add_argument('key', metavar='API-KEY', type=str, help='Billing API key')
+  args = parser.parse_args()
+
+  billingSync = Gaiia(args.verbose, args.logFile)
+
+  billingSync.logger.warning("%s synchronization script starts (v1.0)" % datetime.datetime.now())
+
+  url = "https://" + args.server + "/api/v1"
+  headers = {
+   #"Accept-Encoding": "chunked",
+   #"Connection": "keep-alive",
+   "Content-Type": "application/json",
+   "X-Gaiia-Api-Key": args.key
+  }
+
+  products = billingSync.getInternetPlans(url, headers)
+  accounts = billingSync.getAccounts(url, headers)
+  billingSync.logger.warning("%s queries to billing completed" % datetime.datetime.now())
+
+  data = billingSync.normalizeData(products, accounts, args.dualStack)
+  billingSync.logger.warning("%s data normalization completed" % datetime.datetime.now())
+
+  if args.verbose > 0:
+    billingSync.printData(data)
+  if args.bqn:
+    billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
+
+  billingSync.logger.warning("%s synchronization script ends" % datetime.datetime.now())
