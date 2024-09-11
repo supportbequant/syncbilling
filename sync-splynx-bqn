@@ -52,8 +52,8 @@ class SplynxSync(BillingSync):
     rspJson = json.loads(rsp.text)
     return rspJson
 
-  def normalizeData(self, tariffs, customers):
-    data = {'subscribers': [], 'policies': []}
+  def normalizeData(self, tariffs, customers, dualStack, ipv6Mask):
+    data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
     for t in tariffs:
       data["policies"].append({
         "policyName": t["service_name"],
@@ -75,6 +75,25 @@ class SplynxSync(BillingSync):
         "state": c["blocked"],
         "block": c["blocked"] == "1"
       })
+      if c["ipv6"]:
+        if c["ipv6_prefix"] != ipv6Mask:
+          self.logger.warning("IPv6 subscriber with mask %d != expected %d" % (c["ipv6_prefix"], ipv6Mask))
+        else:
+          data["subscribers"].append({
+            "subscriberIp": c["ipv6"],
+            "subscriberId": c["login"],
+            "policyRate" : tariff["service_name"],
+            "state": c["blocked"],
+            "block": c["blocked"] == "1"
+          })
+      if dualStack and c["ipv6"]:
+        subGroup = {}
+        subGroup["subscriberGroupName"] = "DS-%s" % c["login"]
+        subGroup["policyRate"] = tariff["service_name"]
+        subGroup["subscriberMembers"] = [c["ipv4"]]
+        subGroup["subscriberRanges"] = ["%s/%d" % (c["ipv6"], c["ipv6_prefix"])]
+        data["subscriberGroups"].append(subGroup)
+
     return data
 
 ################################################################################
@@ -102,6 +121,10 @@ if __name__ == "__main__":
                       nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
   parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
                     help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('-ds', '--dual-stack', action='store_true', dest="dualStack", default=False, 
+      help='Group v4 and v6 IP addresses of same subscriber under same rate limit. Requires BQN R4.22 or later. If absent, no group created')
+  parser.add_argument('-msk', '--v6-expected-mask', help='Expected IPv6 mask. 64 by default.',
+               type=int, default=64, dest='ipv6Mask')
   parser.add_argument('server', metavar='SERVER', type=str, help="Billing server")
   parser.add_argument('key', metavar='API-KEY', type=str, help='Billing REST API key')
   parser.add_argument('secret', metavar='SECRET', type=str, help='Billing API secret')
@@ -124,7 +147,7 @@ if __name__ == "__main__":
   customers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customers-online')
 
 
-  data = billingSync.normalizeData(tariffs, customers)
+  data = billingSync.normalizeData(tariffs, customers, args.dualStack, args.ipv6Mask)
   billingSync.printData(data)
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
