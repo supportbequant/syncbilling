@@ -316,9 +316,27 @@ class SonarSync(BillingSync):
 
   ############################################################################
 
-  def normalizeData(self, accounts, services, delinquents, sites):
-    data = {'subscribers': [], 'policies': []}
+  def getAddressInfo(self, addr, ipv6Mask=64):
+    parts = addr.split('/')
+    isV4 = "." in addr
+    if len(parts) == 1:  # no mask
+      if isV4:
+        return 4, addr, 32
+      else:
+        return 6, addr, ipv6Mask
+    elif len(parts) == 2:
+      if isV4:
+        return 4, parts[0], int(parts[1])
+      else:
+        return 6, parts[0], int(parts[1])
+    raise Exception("Cannot split IP address %s, unexpected format" % addr)
+
+  def normalizeData(self, accounts, services, delinquents, sites, dualStack, ipv6Mask):
+    data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
+    subnetGroups = {}  # Structure to decide about address grouping
   
+    # Policies
+    #
     for s in services:
       data["policies"].append({
         "policyName": "%s-%s" % (s["name"], s["id"]),
@@ -328,6 +346,8 @@ class SonarSync(BillingSync):
         "rateLimitUplink": {"rate": int(s["data_service_detail"]["upload_speed_kilobits_per_second"])}
         })
 
+    # Subscribers
+    #
     for a in accounts:
       if not "ipassignmenthistoryable" in a or \
           not "account_services" in a["ipassignmenthistoryable"] or \
@@ -355,31 +375,76 @@ class SonarSync(BillingSync):
         matches = [x for x in delinquents if x["id"] == a["ipassignmenthistoryable"]["id"]]
         blockStatus = len(matches) != 0
         if blockStatus:
-          self.logger.debug("Delinquent blocked %s" % a["ipassignmenthistoryable"]["name"])
+          self.logger.debug("Delinquent blocked %s" % a["ipassignmenthistoryable"]["name"])    
 
-      # We assume sites have been filtered so fields of interest always exist
-      subGroups = []
-      foundSites = [x for x in sites if x["subnet"] == a["subnet"]]
-      if len(foundSites) > 0:
-        for site in foundSites:
-          for inventoryField in site["ipassignmentable"]["inventory_item"]["parent_inventory_item"]["inventory_model_field_data"]["entities"]:
-            for ipAssignment in inventoryField["ip_assignments"]["entities"]:
-              if self.fieldIsNotNull(ipAssignment, ["description"]):
-                subGroups.append("L1-" + ipAssignment["description"])
-                self.logger.debug("Subscriber %s %s in group %s" % ( a["ipassignmenthistoryable"]["name"], a["subnet"], ipAssignment["description"]))
-      else:
-        self.logger.debug("Account %s %s in no site" %  (a["ipassignmenthistoryable"]["name"], a["subnet"]))
-      # Remove duplicates
-      subGroups = list(set(subGroups))
+      # If IP address is IPv6 and without expected prefix, the subscriber is not created
+      ipVersion, addr, mask = self.getAddressInfo(a["subnet"], ipv6Mask)
+      if ipVersion == 4 or mask == ipv6Mask:
+        data["subscribers"].append({
+          "subscriberIp": addr,
+          "subscriberId": a["ipassignmenthistoryable"]["name"],
+          "policyRate" : policy["policyName"],
+          "state": a["ipassignmenthistoryable"]["account_status"]["name"],
+          "block": blockStatus
+        })
 
-      data["subscribers"].append({
-        "subscriberIp": a["subnet"],
-        "subscriberId": a["ipassignmenthistoryable"]["name"],
-        "policyRate" : policy["policyName"],
-        "state": a["ipassignmenthistoryable"]["account_status"]["name"],
-        "block": blockStatus,
-        "subscriberGroups": subGroups
-      })
+      # Fill structure for dual stack grouping later on
+      id = a["ipassignmenthistoryable"]["id"] 
+      if not id in subnetGroups:
+        subnetGroups[id] = {
+          "subscriberId":  a["ipassignmenthistoryable"]["name"],
+          "subnets": []
+        }
+      subnetGroups[id]["subnets"].append({"subnet": a["subnet"], "policyRate": policy["policyName"]})
+
+    # Topology groups
+    # We assume sites have been filtered so fields of interest always exist
+    #
+    siteGroups = {}
+    for site in sites:
+      for inventoryField in site["ipassignmentable"]["inventory_item"]["parent_inventory_item"]["inventory_model_field_data"]["entities"]:
+        for ipAssignment in inventoryField["ip_assignments"]["entities"]:
+          if self.fieldIsNotNull(ipAssignment, ["description"]):
+            if not ipAssignment["description"] in siteGroups:
+              siteGroups[ipAssignment["description"]] = [site["subnet"]]
+            else:
+              siteGroups[ipAssignment["description"]].append(site["subnet"])
+    for siteName, siteMembers in siteGroups.items():
+      subGroup = {}
+      subGroup["subscriberGroupName"] = "L1-" + siteName
+      subGroup["subscriberMembers"] = []
+      subGroup["subscriberRanges"] = []
+      for member in siteMembers:
+        if "/" in member:
+          subGroup["subscriberRanges"].append(member)
+        else:
+          subGroup["subscriberMembers"].append(member)
+      data["subscriberGroups"].append(subGroup)
+
+    # dual stack groups
+    #
+    if dualStack:
+      for id, sng in subnetGroups.items():
+        if len(sng["subnets"]) > 1:  # Subscriber with more than one address
+          policy = sng["subnets"][0]["policyRate"]
+          samePolicy = True
+          for s in sng["subnets"]:
+            if s["policyRate"] != policy:
+              self.logger.debug("Subscriber %s with IPs %s with different policies" % (sng["subscriberId"], len(sng["subnets"])))
+              samePolicy = False
+              break
+          if samePolicy:
+            subGroup = {}
+            subGroup["subscriberGroupName"] = "DS-%s" % sng["subscriberId"]
+            subGroup["policyRate"] = policy
+            subGroup["subscriberMembers"] = []
+            for s in sng["subnets"]:
+              ipVersion, addr, mask = self.getAddressInfo(s["subnet"], ipv6Mask)
+              if ipVersion == 6 and mask != ipv6Mask:
+                subGroup["subscriberRanges"] = ["%s/%s" % (addr, mask)]
+              else:
+               subGroup["subscriberMembers"].append(addr)
+            data["subscriberGroups"].append(subGroup)
 
     return data
 
@@ -410,6 +475,10 @@ if __name__ == "__main__":
                     help="Display extra informationt (repeat for increased verbosity)")
   parser.add_argument('-d', help='If present, blocking govered by delinquency',
                       dest='delinquent', action="store_true", default=False)
+  parser.add_argument('-ds', '--dual-stack', action='store_true', dest="dualStack", default=False, 
+     help='Group v4 and v6 IP addresses of same subscriber under same rate limit. Requires BQN R4.22 or later. If absent, no group created')
+  parser.add_argument('-msk', '--v6-expected-mask', help='Expected IPv6 mask. 64 by default.',
+               type=int, default=64, dest='ipv6Mask')
   parser.add_argument('server', metavar='SERVER', type=str, help="Billing server")
   parser.add_argument('key', metavar='API-KEY', type=str, help='Billing API key')
   args = parser.parse_args()
@@ -434,7 +503,7 @@ if __name__ == "__main__":
     delinquents = None
   sites = billingSync.getSites(url, headers)
   
-  data = billingSync.normalizeData(accounts, services, delinquents, sites)
+  data = billingSync.normalizeData(accounts, services, delinquents, sites, args.dualStack, args.ipv6Mask)
   billingSync.printData(data)
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
