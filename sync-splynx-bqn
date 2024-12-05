@@ -52,6 +52,8 @@ class SplynxSync(BillingSync):
     rspJson = json.loads(rsp.text)
     return rspJson
 
+  ############################################################################
+
   def normalizeData(self, tariffs, customers, dualStack, ipv6Mask):
     data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
     for t in tariffs:
@@ -96,6 +98,31 @@ class SplynxSync(BillingSync):
 
     return data
 
+  ############################################################################
+
+  def normalizeSites(self, sites, customers, allCustomers):
+    groups = []
+    for c in allCustomers:
+      sts = [x for x in sites if x["location_id"] == c["location_id"]]
+      if len(sts) == 0:
+        continue
+      elif len(sts) == 1:
+        onlines = [x for x in customers if x["customer_id"] == c["id"]]
+        if len(onlines) > 0:
+          subGroup = {}
+          # We create a group with first site (there should be only one)
+          subGroup["subscriberGroupName"] = "L2-%s" % sts[0]["title"]
+          subGroup["subscriberMembers"] = []
+          subGroup["subscriberRanges"] = []
+          for oc in onlines:
+            subGroup["subscriberMembers"].append(oc["ipv4"])
+            if oc["ipv6"]:
+              subGroup["subscriberRanges"].append("%s/%d" % (oc["ipv6"], oc["ipv6_prefix"]))
+          groups.append(subGroup)
+      else:
+        self.logger.warning("Subscriber id %s with more than one site" % c["id"])
+    return groups
+
 ################################################################################
 
 if __name__ == "__main__":
@@ -125,6 +152,8 @@ if __name__ == "__main__":
       help='Group v4 and v6 IP addresses of same subscriber under same rate limit. Requires BQN R4.22 or later. If absent, no group created')
   parser.add_argument('-msk', '--v6-expected-mask', help='Expected IPv6 mask. 64 by default.',
                type=int, default=64, dest='ipv6Mask')
+  parser.add_argument('-ns', '--network-sites', action='store_true', dest="networkSites", default=False, 
+      help='Group subscribers based on their network sites. Requires BQN R4.22 or later and customer and network sites view permits. If absent, no group created')
   parser.add_argument('server', metavar='SERVER', type=str, help="Billing server")
   parser.add_argument('key', metavar='API-KEY', type=str, help='Billing REST API key')
   parser.add_argument('secret', metavar='SECRET', type=str, help='Billing API secret')
@@ -146,9 +175,15 @@ if __name__ == "__main__":
   tariffs = billingSync.getEntries(args.server, args.key, args.secret, '/tariffs/internet')
   customers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customers-online')
   #fups = billingSync.getEntries(args.server, args.key, args.secret, '/fup/policies')
-  fupStatus = billingSync.getEntries(args.server, args.key, args.secret, '/fup/compiler') # No action, just reading
+  #fupStatus = billingSync.getEntries(args.server, args.key, args.secret, '/fup/compiler') # No action, just reading
 
   data = billingSync.normalizeData(tariffs, customers, args.dualStack, args.ipv6Mask)
+
+  if args.networkSites:
+    sites = billingSync.getEntries(args.server, args.key, args.secret, '/networking/network-sites')
+    allCustomers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customer')
+    data["subscriberGroups"] += billingSync.normalizeSites(sites, customers, allCustomers)
+
   billingSync.printData(data)
   if args.bqn:
     billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
