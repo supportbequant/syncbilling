@@ -101,27 +101,24 @@ class SplynxSync(BillingSync):
   ############################################################################
 
   def normalizeSites(self, sites, customers, allCustomers):
-    groups = []
+    groups = {}
+    customerLocations = {}
+    for s in sites:
+      groups[s["location_id"]] = {
+        "subscriberGroupName": "L1-%s" % s["title"],
+        "subscriberMembers": [],
+        "subscriberRanges": []
+        }
     for c in allCustomers:
-      sts = [x for x in sites if x["location_id"] == c["location_id"]]
-      if len(sts) == 0:
-        continue
-      elif len(sts) == 1:
-        onlines = [x for x in customers if x["customer_id"] == c["id"]]
-        if len(onlines) > 0:
-          subGroup = {}
-          # We create a group with first site (there should be only one)
-          subGroup["subscriberGroupName"] = "L2-%s" % sts[0]["title"]
-          subGroup["subscriberMembers"] = []
-          subGroup["subscriberRanges"] = []
-          for oc in onlines:
-            subGroup["subscriberMembers"].append(oc["ipv4"])
-            if oc["ipv6"]:
-              subGroup["subscriberRanges"].append("%s/%d" % (oc["ipv6"], oc["ipv6_prefix"]))
-          groups.append(subGroup)
-      else:
-        self.logger.warning("Subscriber id %s with more than one site" % c["id"])
-    return groups
+      customerLocations[c["id"]] = c["location_id"] 
+    for c in customers:
+      if c["customer_id"] in customerLocations and customerLocations[c["customer_id"]] in groups:
+        grp = groups[customerLocations[c["customer_id"]]]
+        grp["subscriberMembers"].append(c["ipv4"])
+        if c["ipv6"]:
+           grp["subscriberRanges"].append("%s/%d" % (c["ipv6"], c["ipv6_prefix"]))
+
+    return list(groups.values())
 
 ################################################################################
 
