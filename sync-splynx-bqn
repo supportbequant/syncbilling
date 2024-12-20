@@ -54,8 +54,17 @@ class SplynxSync(BillingSync):
 
   ############################################################################
 
-  def normalizeData(self, tariffs, customers, dualStack, ipv6Mask, idSource):
+  def normalizeData(self, tariffs, customers, allCustomers, dualStack, ipv6Mask, idSource):
     data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
+
+    customerHashTable = {}
+    for c in allCustomers:
+      customerHashTable[c["id"]] = c 
+
+    tariffHashTable = {}
+    for t in tariffs:
+      tariffHashTable[t["id"]] = t 
+
     for t in tariffs:
       data["policies"].append({
         "policyName": t["service_name"],
@@ -63,19 +72,23 @@ class SplynxSync(BillingSync):
         "rateLimitDownlink": {"rate": int(t["speed_download"])},
         "rateLimitUplink": {"rate": int(t["speed_upload"])}
         })
+
     for c in customers:
-      matches = [x for x in tariffs if x["id"] == c["tariff_id"]]
-      if len(matches) == 1:
-        tariff = matches[0]
-      else:
-        self.logger.warning("Tariff not found (%s)" % c["tariff_id"])
+      if not c["tariff_id"] in tariffHashTable:
+        self.logger.warning("Tariff %s not found for customer id %s" % (c["tariff_id"], c["customer_id"]))
         continue
+      tariff = tariffHashTable[c["tariff_id"]]
+      if not c["customer_id"] in customerHashTable:
+        self.logger.warning("Customer information not found for id %s" % c["customer_id"])
+        continue
+      cInfo = customerHashTable[c["customer_id"]]
+
       data["subscribers"].append({
         "subscriberIp": c["ipv4"],
-        "subscriberId": str(c[idSource]),
+        "subscriberId": str(cInfo[idSource]),
         "policyRate" : tariff["service_name"],
-        "state": c["blocked"],
-        "block": c["blocked"] == "1"
+        "state": cInfo["status"],
+        "block": cInfo["status"] != "active"
       })
       if c["ipv6"]:
         if c["ipv6_prefix"] != ipv6Mask:
@@ -83,14 +96,14 @@ class SplynxSync(BillingSync):
         else:
           data["subscribers"].append({
             "subscriberIp": c["ipv6"],
-            "subscriberId": str(c[idSource]),
+            "subscriberId": str(cInfo[idSource]),
             "policyRate" : tariff["service_name"],
-            "state": c["blocked"],
-            "block": c["blocked"] == "1"
+            "state": cInfo["status"],
+            "block": cInfo["status"] != "active"
           })
       if dualStack and c["ipv6"]:
         subGroup = {}
-        subGroup["subscriberGroupName"] = "DS-%s" % c[idSource]
+        subGroup["subscriberGroupName"] = "DS-%s" % cInfo[idSource]
         subGroup["policyRate"] = tariff["service_name"]
         subGroup["subscriberMembers"] = [c["ipv4"]]
         subGroup["subscriberRanges"] = ["%s/%d" % (c["ipv6"], c["ipv6_prefix"])]
@@ -131,8 +144,11 @@ if __name__ == "__main__":
   Requires an API KEY and SECRET in Splynx and the REST API enabled in BQN.
 
   BQN Rate policies are identified by Splynx "tariffs", with spaces replaced by undescores.
-  BQN subscribers are identified by Splynx "customers-online". We use "login" as subscriber ID.
-  Customers with "blocked" = "1" have their traffic blocked by BQN.
+  BQN subscribers are identified by Splynx "customers".
+  BQN IPs are identified by Splynx "customers-online".
+  BQN subscriber groups are obtained from customer "location_id" mapped to "network-sites".
+
+  Customers in status != "active" have their traffic blocked by BQN.
 
   Known limitations:
   - Multiple IP addresses in same contract not supported.
@@ -153,8 +169,8 @@ if __name__ == "__main__":
       help='Group subscribers based on their network sites. Requires BQN R4.22 or later and customer and network sites view permits. If absent, no group created')
   parser.add_argument('-np', '--no-policies', action='store_true', dest="noPolicies", default=False, 
       help='If present, no policies are retried. False by default')
-  parser.add_argument('-id', '--id-source', choices=['login', 'username_real', 'customer_id'], \
-      dest="idSource", default="login", help='Customer field to use as subscriber ID. "login" by default')
+  parser.add_argument('-id', '--id-source', choices=['name', 'email', 'login'], \
+      dest="idSource", default="name", help='Customer field to use as subscriber ID. "name" by default')
   parser.add_argument('server', metavar='SERVER', type=str, help="Billing server")
   parser.add_argument('key', metavar='API-KEY', type=str, help='Billing REST API key')
   parser.add_argument('secret', metavar='SECRET', type=str, help='Billing API secret')
@@ -163,7 +179,7 @@ if __name__ == "__main__":
 
   billingSync = SplynxSync(args.verbose)
 
-  billingSync.logger.warning("%s synchronization script starts (v1.6)" % datetime.datetime.now())
+  billingSync.logger.warning("%s synchronization script starts (v2.0)" % datetime.datetime.now())
 
   url = "https://" + args.server + "/api/2.0/admin"
   credentials = base64.b64encode((args.key + ":" + args.secret).encode("utf-8")).decode("utf-8")
@@ -173,17 +189,18 @@ if __name__ == "__main__":
    "Accept-Encoding": "gzip, deflate",
    "Connection": "keep-alive"
   }
-  tariffs = billingSync.getEntries(args.server, args.key, args.secret, '/tariffs/internet')
+
   customers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customers-online')
+  allCustomers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customer')
 
   if args.noPolicies:
     data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
   else:
-    data = billingSync.normalizeData(tariffs, customers, args.dualStack, args.ipv6Mask, args.idSource)
+    tariffs = billingSync.getEntries(args.server, args.key, args.secret, '/tariffs/internet')
+    data = billingSync.normalizeData(tariffs, customers, allCustomers, args.dualStack, args.ipv6Mask, args.idSource)
 
   if args.networkSites:
     sites = billingSync.getEntries(args.server, args.key, args.secret, '/networking/network-sites')
-    allCustomers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customer')
     data["subscriberGroups"] += billingSync.normalizeSites(sites, customers, allCustomers)
 
   billingSync.printData(data)
