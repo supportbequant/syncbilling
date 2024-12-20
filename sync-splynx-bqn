@@ -54,18 +54,10 @@ class SplynxSync(BillingSync):
 
   ############################################################################
 
-  def normalizeData(self, tariffs, customers, allCustomers, dualStack, ipv6Mask, idSource):
+  def normalizeData(self, tariffHashTable, customers, allCustomersHashTable, dualStack, ipv6Mask, idSource):
     data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
 
-    customerHashTable = {}
-    for c in allCustomers:
-      customerHashTable[c["id"]] = c 
-
-    tariffHashTable = {}
-    for t in tariffs:
-      tariffHashTable[t["id"]] = t 
-
-    for t in tariffs:
+    for t in list(tariffHashTable.values()):
       data["policies"].append({
         "policyName": t["service_name"],
         "policyId": str(t["id"]),
@@ -78,10 +70,10 @@ class SplynxSync(BillingSync):
         self.logger.warning("Tariff %s not found for customer id %s" % (c["tariff_id"], c["customer_id"]))
         continue
       tariff = tariffHashTable[c["tariff_id"]]
-      if not c["customer_id"] in customerHashTable:
+      if not c["customer_id"] in allCustomersHashTable:
         self.logger.warning("Customer information not found for id %s" % c["customer_id"])
         continue
-      cInfo = customerHashTable[c["customer_id"]]
+      cInfo = allCustomersHashTable[c["customer_id"]]
 
       data["subscribers"].append({
         "subscriberIp": c["ipv4"],
@@ -113,24 +105,41 @@ class SplynxSync(BillingSync):
 
   ############################################################################
 
-  def normalizeSites(self, sites, customers, allCustomers):
+  def normalizeSites(self, sites, customers, allCustomersHashTable):
     groups = {}
-    customerLocations = {}
     for s in sites:
       groups[s["location_id"]] = {
         "subscriberGroupName": "L1-%s" % s["title"],
         "subscriberMembers": [],
         "subscriberRanges": []
         }
-    for c in allCustomers:
-      customerLocations[c["id"]] = c["location_id"] 
     for c in customers:
-      if c["customer_id"] in customerLocations and customerLocations[c["customer_id"]] in groups:
-        grp = groups[customerLocations[c["customer_id"]]]
+      if c["customer_id"] in allCustomersHashTable and allCustomersHashTable[c["customer_id"]]["location_id"] in groups:
+        grp = groups[allCustomersHashTable[c["customer_id"]]["location_id"]]
         grp["subscriberMembers"].append(c["ipv4"])
         if c["ipv6"]:
            grp["subscriberRanges"].append("%s/%d" % (c["ipv6"], c["ipv6_prefix"]))
     
+    return [ x for x in list(groups.values()) if len(x["subscriberMembers"]) > 0 or len(x["subscriberRanges"]) > 0 ]
+
+  ############################################################################
+
+  def normalizeLabels(self, customers, allCustomersHashTable):
+    groups = {}
+    for c in customers:
+      if c["customer_id"] in allCustomersHashTable:
+        for label in allCustomersHashTable[c["customer_id"]]["customer_labels"]:
+          grpName = "L2-%s" % label["label"]
+          if not grpName in groups:
+            groups[grpName] = {
+              "subscriberGroupName": grpName,
+              "subscriberMembers": [],
+              "subscriberRanges": []
+              }
+          grp = groups[grpName]
+          grp["subscriberMembers"].append(c["ipv4"])
+          if c["ipv6"]:
+             grp["subscriberRanges"].append("%s/%d" % (c["ipv6"], c["ipv6_prefix"]))
     return [ x for x in list(groups.values()) if len(x["subscriberMembers"]) > 0 or len(x["subscriberRanges"]) > 0 ]
 
 ################################################################################
@@ -142,6 +151,7 @@ if __name__ == "__main__":
   Synchronizes speed limits in Splynx contracts with BQN rate policies.
 
   Requires an API KEY and SECRET in Splynx and the REST API enabled in BQN.
+  Requires view permits for customers/customer, customers/customers-online and tariffs/internet.
 
   BQN Rate policies are identified by Splynx "tariffs", with spaces replaced by undescores.
   BQN subscribers are identified by Splynx "customers".
@@ -166,7 +176,9 @@ if __name__ == "__main__":
   parser.add_argument('-msk', '--v6-expected-mask', help='Expected IPv6 mask. 64 by default.',
                type=int, default=64, dest='ipv6Mask')
   parser.add_argument('-ns', '--network-sites', action='store_true', dest="networkSites", default=False, 
-      help='Group subscribers based on their network sites. Requires BQN R4.22 or later and customer and network sites view permits. If absent, no group created')
+      help='Group subscribers based on their network sites. Requires BQN R4.22 or later and network sites view permits. If absent, no group created')
+  parser.add_argument('-lb', '--labels', action='store_true', dest="labels", default=False, 
+      help='Group subscribers based on their labels. Requires BQN R4.22 or later and customer view permits. If absent, no group created')
   parser.add_argument('-np', '--no-policies', action='store_true', dest="noPolicies", default=False, 
       help='If present, no policies are retried. False by default')
   parser.add_argument('-id', '--id-source', choices=['name', 'email', 'login'], \
@@ -192,16 +204,25 @@ if __name__ == "__main__":
 
   customers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customers-online')
   allCustomers = billingSync.getEntries(args.server, args.key, args.secret, '/customers/customer')
+  allCustomerHashTable = {}
+  for c in allCustomers:
+    allCustomerHashTable[c["id"]] = c 
 
   if args.noPolicies:
     data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
   else:
     tariffs = billingSync.getEntries(args.server, args.key, args.secret, '/tariffs/internet')
-    data = billingSync.normalizeData(tariffs, customers, allCustomers, args.dualStack, args.ipv6Mask, args.idSource)
+    tariffHashTable = {}
+    for t in tariffs:
+      tariffHashTable[t["id"]] = t 
+    data = billingSync.normalizeData(tariffHashTable, customers, allCustomerHashTable, args.dualStack, args.ipv6Mask, args.idSource)
 
   if args.networkSites:
     sites = billingSync.getEntries(args.server, args.key, args.secret, '/networking/network-sites')
-    data["subscriberGroups"] += billingSync.normalizeSites(sites, customers, allCustomers)
+    data["subscriberGroups"] += billingSync.normalizeSites(sites, customers, allCustomerHashTable)
+
+  if args.labels:
+    data["subscriberGroups"] += billingSync.normalizeLabels(customers, allCustomerHashTable)
 
   billingSync.printData(data)
   if args.bqn:
