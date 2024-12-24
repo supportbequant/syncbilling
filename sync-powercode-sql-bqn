@@ -1,0 +1,209 @@
+#!/usr/bin/python3
+
+################################################################################
+#
+# Copyright (c) 2022 Bequant S.L.
+# All rights reserved.
+#
+# This product or document is proprietary to and embodies the
+# confidential technology of Bequant S.L., Spain.
+# Possession, use, duplication or distribution of this product
+# or document is authorized only pursuant to a valid written
+# license from Bequant S.L.
+#
+#
+################################################################################
+
+import json
+import argparse
+import datetime
+import subprocess
+
+import requests
+if not requests.__version__.startswith("1."):
+  # Avoid insecure warning when issuing REST queries
+  import urllib3
+  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from BillingSync import BillingSync
+from IpAddress import IpAddress
+
+################################################################################
+
+class PowercodeSync(BillingSync):
+
+  ############################################################################
+
+  def getSqlResponse(self, server, srvUser, srvPassword, database, dbUser, dbPassword, logFile):
+
+    rspFile = "/tmp/pcsql-rsp.txt"
+    errFile = "/tmp/pcsql-error.txt"
+    cmd = """echo "mysql --silent -u '%s' -p'%s' '%s' <<EOF
+SELECT CONCAT('{ \\"equipment\\": ', JSON_ARRAYAGG(JSON_OBJECT(
+  'equipmentId', e.ID,
+  'macAddress', e.MACAddress,
+  'ipAddress', INET_NTOA(ar.StartAddress + e.IPAddress),
+  'ipv6Address', INET6_NTOA(ar.StartAddressv6 + e.IPv6Address),
+  'location_id', e.LocationID,
+  'customerID', c.CustomerID,
+  'status', c.Status,
+  'serviceID', s.ID,
+  'name', c.CompanyName
+  )), ',')
+FROM Equipment e
+  INNER JOIN Customer c ON e.EndUserID = c.CustomerID
+  INNER JOIN CustomerServices cs ON c.CustomerID = cs.CustomerID
+  INNER JOIN Services s ON cs.ServiceID = s.ID AND s.Type = 'Monthly Internet'
+  INNER JOIN AddressRange ar ON (e.IPType = ar.AddressRangeID) OR (e.IPTypev6 = ar.IPV6AddressRangeID)
+  INNER JOIN InternetInfo ii ON s.ID = ii.ServiceID
+WHERE e.EndUserID != 1;
+
+SELECT CONCAT('\\"services\\": ', JSON_ARRAYAGG(JSON_OBJECT(
+  'serviceID', s.ID,
+  'description', s.Discription,
+  'ispDescription', s.ISPDescription,
+  'maxIn', ii.MaxIn,
+  'maxOut', ii.MaxOut,
+  'burstIn', ii.BurstIn,
+  'burstOut', ii.BurstOut,
+  'burstBucketTime',ii.BurstBucketTime
+  )), ' }')
+FROM Services s
+  INNER JOIN InternetInfo ii ON s.ID = ii.ServiceID;
+EOF" | sshpass -p %s ssh -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "%s@%s" bash -s -- >%s 2>%s
+""" % ( 
+        dbUser, dbPassword, database,
+        srvPassword, srvUser, server,
+        rspFile,
+        logFile if logFile else errFile
+      )
+    self.logger.debug(cmd)
+    proc = subprocess.run(cmd,
+            check=True, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding='ascii')
+    with open(rspFile) as f:
+      return json.load(f)
+  
+    return None
+
+  ############################################################################
+
+  def getEquipments(self, sqlResponse):
+    return sqlResponse["equipment"]
+
+  ############################################################################
+
+  def getServices(self, sqlResponse):
+    return sqlResponse["services"]
+
+  ############################################################################
+
+  def normalizeData(self, equipments, services, networkSites):
+    
+    data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
+
+    for s in services:
+      data["policies"].append({
+          "policyName": s["description"],
+          "policyId": str(s["serviceID"]),
+          "rateLimitDownlink": {
+            "rate": int(s["maxIn"]),
+            "burstRate":  int(s["burstIn"])
+          },
+          "rateLimitUplink": {
+            "rate": int(s["maxOut"]),
+            "burstRate":  int(s["burstOut"])
+          }
+      })
+
+    serviceById = {}
+    for s in services:
+      serviceById[s["serviceID"]] = s
+   
+    for e in equipments:
+      if not e["serviceID"] in serviceById:
+        self.logger.debug('Subscriber ID %s without known monthly internet service, ignored' % e["customerID"])
+        continue
+      policyName = serviceById[e["serviceID"]]["description"]
+      data["subscribers"].append({
+        "subscriberIp": e["ipAddress"],
+        "subscriberId": str(e["customerID"]),
+        "policyRate" : policyName,
+        "state": e["status"],
+        "block": e["status"] != "Active"
+      })
+    
+    if networkSites:
+      nwGroups = {}
+      for e in equipments:
+        if not e["location_id"] in nwGroups:
+          nwGroups[e["location_id"]] = {
+            "subscriberGroupName": "L1-%s" % e["location_id"],
+            "subscriberMembers": [],
+            "subscriberRanges": []
+          }
+        nwGroups[e["location_id"]]["subscriberMembers"].append(e["ipAddress"])
+        if e["ipv6Address"]:
+          nwGroups[e["location_id"]]["subscriberMembers"].append(IpAddress.toString(e["ipv6Address"]))
+      data["subscriberGroups"] += [ x for x in list(nwGroups.values()) if len(x["subscriberMembers"]) > 0 or len(x["subscriberRanges"]) > 0 ]
+
+    self.logger.debug(data)
+
+    return data
+
+################################################################################
+
+if __name__ == "__main__":
+
+  parser = argparse.ArgumentParser(
+    description="""
+  Synchronizes speed limits in Powercode SQL with BQN rate policies.
+
+  Requires user/passwd with SSH access to Powercode server and another user/password
+  for database in the Powercode server, as well as REST API enabled in BQN.
+
+  Known limitations:
+  - Multiple IP addresses in same contract not supported.
+  - If the synchronization fails, no retry is attempted (must be don e externally).
+  - No scheduling of script execution (must be done externally).
+  - No IPv6 addresses supported (more infro needed on Powercode handling of IPv6)
+  """, formatter_class=argparse.RawTextHelpFormatter)
+
+  parser.add_argument('-b', help='BQN address and REST credentials. If absent, no BQN synchronization',
+                      nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
+  parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
+                    help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('-ns', '--network-sites', action='store_true', dest="networkSites", default=False, 
+      help='Group subscribers based on their locations. Requires BQN R4.22 or later. If absent, no group created')  
+  parser.add_argument('-lf', '--log-file', default=None, type=str, dest="logFile",
+      help='Log file to use. If absent, logs go to the standard output')
+  parser.add_argument('-db', '--database',  type=str, dest="database", default="powernoc", 
+      help='Name of the database. Default powercode.')
+
+  parser.add_argument('server', metavar='SERVER', type=str, help='Billing server')
+  parser.add_argument('srvUser', metavar='SERVER-USER', type=str, help='Billing server user')
+  parser.add_argument('srvPassword', metavar='SERVER-PASSWORD', type=str, help='Billing server password')
+  parser.add_argument('dbUser', metavar='DB-USER', type=str, help='Billing database user')
+  parser.add_argument('dbPassword', metavar='DB-PASSWORD', type=str, help='Billing database password')
+
+  args = parser.parse_args()
+
+  billingSync = PowercodeSync(args.verbose)
+
+  billingSync.logger.warning("%s synchronization script starts (v1.1)" % datetime.datetime.now())
+
+  sqlResponse = billingSync.getSqlResponse(args.server, args.srvUser, args.srvPassword, args.database, args.dbUser, args.dbPassword, args.logFile)
+  equipments = billingSync.getEquipments(sqlResponse)
+  services = billingSync.getServices(sqlResponse)
+  
+  data = billingSync.normalizeData(equipments, services, args.networkSites)
+
+  billingSync.printData(data)
+  if args.bqn:
+    billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
+
+  billingSync.logger.warning("%s synchronization script ends" % datetime.datetime.now())
+
+
+
