@@ -38,12 +38,15 @@ class PowercodeSync(BillingSync):
 
     rspFile = "/tmp/pcsql-rsp.txt"
     errFile = "/tmp/pcsql-error.txt"
+    # We get the start IPv6 address and offset separately because I could not find a way to 
+    # calculate it directly in SQL (tried CAST, SUBSTRING + CONCAT, OR and other options, but varbinary + bigint arithmetic badly supported)
     cmd = """echo "mysql --silent -u '%s' -p'%s' '%s' <<EOF
 SELECT CONCAT('{ \\"equipment\\": ', JSON_ARRAYAGG(JSON_OBJECT(
   'equipmentId', e.ID,
   'macAddress', e.MACAddress,
   'ipAddress', INET_NTOA(ar.StartAddress + e.IPAddress),
-  'ipv6Address', INET6_NTOA(ar.StartAddressv6 + e.IPv6Address),
+  'ipv6AddressStart', INET6_NTOA(arv6.StartAddressv6),
+  'ipv6AddressOffset', e.IPv6Address,
   'location_id', e.LocationID,
   'customerID', c.CustomerID,
   'status', c.Status,
@@ -54,7 +57,8 @@ FROM Equipment e
   INNER JOIN Customer c ON e.EndUserID = c.CustomerID
   INNER JOIN CustomerServices cs ON c.CustomerID = cs.CustomerID
   INNER JOIN Services s ON cs.ServiceID = s.ID AND s.Type = 'Monthly Internet'
-  INNER JOIN AddressRange ar ON (e.IPType = ar.AddressRangeID) OR (e.IPTypev6 = ar.IPV6AddressRangeID)
+  LEFT JOIN AddressRange ar ON (e.IPType = ar.AddressRangeID)
+  LEFT JOIN AddressRange arv6 ON (e.IPTypev6 = arv6.IPV6AddressRangeID)
   INNER JOIN InternetInfo ii ON s.ID = ii.ServiceID
 WHERE e.EndUserID != 1;
 
@@ -99,7 +103,7 @@ EOF" | sshpass -p %s ssh -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile
 
   ############################################################################
 
-  def normalizeData(self, equipments, services, networkSites):
+  def normalizeData(self, equipments, services, dualStack, ipv6Mask, networkSites):
     
     data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
 
@@ -133,7 +137,22 @@ EOF" | sshpass -p %s ssh -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile
         "state": e["status"],
         "block": e["status"] != "Active"
       })
-    
+      # We are assuming one IPv6 address range of /64 per subscriber
+      if e["ipv6AddressStart"]:
+        data["subscribers"].append({
+          "subscriberIp": e["ipv6AddressStart"],
+          "subscriberId": str(e["customerID"]),
+          "policyRate" : policyName,
+          "state": e["status"],
+          "block": e["status"] != "Active"
+        })
+        if dualStack:
+          dsGroup = {}
+          dsGroup["subscriberGroupName"] = "DS-%s" % e["customerID"]
+          dsGroup["policyRate"] = policyName
+          dsGroup["subscriberMembers"] = [e["ipAddress"], e["ipv6AddressStart"]]
+          data["subscriberGroups"].append(dsGroup)
+
     if networkSites:
       nwGroups = {}
       for e in equipments:
@@ -144,8 +163,9 @@ EOF" | sshpass -p %s ssh -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile
             "subscriberRanges": []
           }
         nwGroups[e["location_id"]]["subscriberMembers"].append(e["ipAddress"])
-        if e["ipv6Address"]:
-          nwGroups[e["location_id"]]["subscriberMembers"].append(IpAddress.toString(e["ipv6Address"]))
+        # We are assuming one IPv6 address range of /64 per subscriber
+        if e["ipv6AddressStart"]:
+          nwGroups[e["location_id"]]["subscriberMembers"].append(e["ipv6AddressStart"])
       data["subscriberGroups"] += [ x for x in list(nwGroups.values()) if len(x["subscriberMembers"]) > 0 or len(x["subscriberRanges"]) > 0 ]
 
     self.logger.debug(data)
@@ -174,6 +194,10 @@ if __name__ == "__main__":
                       nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
   parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
                     help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('-ds', '--dual-stack', action='store_true', dest="dualStack", default=False, 
+      help='Group v4 and v6 IP addresses of same subscriber under same rate limit. Requires BQN R4.22 or later. If absent, no group created')
+  parser.add_argument('-msk', '--v6-expected-mask', help='Expected IPv6 mask. 64 by default.',
+               type=int, default=64, dest='ipv6Mask')
   parser.add_argument('-ns', '--network-sites', action='store_true', dest="networkSites", default=False, 
       help='Group subscribers based on their locations. Requires BQN R4.22 or later. If absent, no group created')  
   parser.add_argument('-lf', '--log-file', default=None, type=str, dest="logFile",
@@ -197,7 +221,7 @@ if __name__ == "__main__":
   equipments = billingSync.getEquipments(sqlResponse)
   services = billingSync.getServices(sqlResponse)
   
-  data = billingSync.normalizeData(equipments, services, args.networkSites)
+  data = billingSync.normalizeData(equipments, services,  args.dualStack, args.ipv6Mask, args.networkSites)
 
   billingSync.printData(data)
   if args.bqn:

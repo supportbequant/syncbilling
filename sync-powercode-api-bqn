@@ -1,0 +1,232 @@
+#!/usr/bin/python3
+
+################################################################################
+#
+# Copyright (c) 2022 Bequant S.L.
+# All rights reserved.
+#
+# This product or document is proprietary to and embodies the
+# confidential technology of Bequant S.L., Spain.
+# Possession, use, duplication or distribution of this product
+# or document is authorized only pursuant to a valid written
+# license from Bequant S.L.
+#
+#
+################################################################################
+
+import json
+import argparse
+import datetime
+
+import requests
+if not requests.__version__.startswith("1."):
+  # Avoid insecure warning when issuing REST queries
+  import urllib3
+  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from BillingSync import BillingSync
+from IpAddress import IpAddress
+
+################################################################################
+
+class PowercodeSync(BillingSync):
+
+  ############################################################################
+
+  def getEntries(self, server, key, bodyParams):
+
+    url = "https://" + server + ":444/api/1/index.php"
+    headers = {
+      "Accept": "application/json",
+      "Accept-Encoding": "gzip, deflate",
+      "Connection": "keep-alive",
+      "Content-type": "application/json"
+    }
+    body = {}
+    body["apiKey"] = key
+    for p in bodyParams:
+      body[p] = bodyParams[p]
+  
+    self.logger.info("POST to %s" % url)
+    rsp = requests.post(url, headers=headers, data=self.jsonDumps(body), verify=False)
+    self.printResponseDetails(rsp)
+    if rsp.status_code != 200:
+      raise Exception("Bad query %d" % rsp.status_code)
+    rspJson = json.loads(rsp.text)
+    return rspJson
+
+  ############################################################################
+
+  def getEquipments(self, server, key, categories):
+    equipments = []
+    for c in categories:
+      rsp = self.getEntries(server, key, {"action": "getEquipmentByCategory", "equipmentCategory": c})
+      if rsp["statusCode"] == 0:
+        equipments += rsp["equipment"]
+    return equipments
+
+  ############################################################################
+
+  def getServices(self, server, key, ids):
+    services = []
+    for id in ids:
+      rsp = self.getEntries(server, key, {"action": "readCustomerService", "customerID": id})
+      if rsp["statusCode"] == 0:
+        monthlyInternet = [x for x in rsp["services"] if x["type"] == "Monthly Internet"]
+        if len(monthlyInternet) == 0:
+           self.logger.debug('Subscriber ID %s without monthly internet service, ignored' % id)
+           continue
+        elif len(monthlyInternet) > 0:
+           activeMonthlyInternet = [x for x in monthlyInternet if x["status"] == "Active"]
+           if len(activeMonthlyInternet) == 0:
+             self.logger.debug('Subscriber ID %s with more than one monthly internet service, none active, first taken' % id)
+             srv = monthlyInternet[0]
+           else:
+             self.logger.debug('Subscriber ID %s with more than one monthly internet service, first active taken' % id)
+             srv = activeMonthlyInternet[0]
+        else: # One monthly server
+           srv = monthlyInternet[0]           
+        srv["customerID"] = id
+        services.append(srv)
+    return services
+
+  ############################################################################
+
+  def normalizeData(self, equipments, services, dualStack, ipv6Mask, networkSites):
+    
+    data = {'subscribers': [], 'policies': [], "subscriberGroups": []}
+
+    serviceHashTable = {}
+    for s in services:
+      if not s["serviceID"] in serviceHashTable:
+        serviceHashTable[s["serviceID"]] = s
+      else:
+        existingService = serviceHashTable[s["serviceID"]]
+        if not self.areEqual(existingService, s, excluded="customerID"):
+           self.logger.warning("Services with same ID %s and different parameters in customers %s and %s" \
+                % (s["serviceID"], existingService["customerID"], s["customerID"]))
+      
+    for s in list(serviceHashTable.values()):
+      data["policies"].append({
+          "policyName": s["description"],
+          "policyId": str(s["serviceID"]),
+          "rateLimitDownlink": {
+            "rate": int(s["internetInfo"]["maxIn"]),
+            "burstRate":  int(s["internetInfo"]["burstIn"])
+          },
+          "rateLimitUplink": {
+            "rate": int(s["internetInfo"]["maxOut"]),
+            "burstRate":  int(s["internetInfo"]["burstOut"])
+          }
+      })
+
+    serviceByCustomer = {}
+    for s in services:
+      serviceByCustomer[s["customerID"]] = s
+   
+    for e in equipments:
+      if not e["endUserId"] in serviceByCustomer:
+        self.logger.debug('Subscriber ID %s without monthly internet service, ignored' % e["endUserId"])
+        continue
+      policyName = serviceByCustomer[e["endUserId"]]["description"]
+      data["subscribers"].append({
+        "subscriberIp": e["ipAddress"],
+        "subscriberId": str(e["endUserId"]),
+        "policyRate" : policyName,
+        "state": serviceByCustomer[e["endUserId"]]["status"],
+        "block": serviceByCustomer[e["endUserId"]]["status"] != "Active"
+      })
+      if e["ipv6Address"]:
+        parts = e["ipv6Address"].split('/')
+        if len(parts) == 2 and int(parts[1]) != ipv6Mask:
+          self.logger.warning("IPv6 subscriber with mask %d != expected %d" % (int(parts[1]), ipv6Mask))
+        else:
+          data["subscribers"].append({
+            "subscriberIp": IpAddress.toString(e["ipv6Address"]),
+            "subscriberId": str(e["endUserId"]),
+            "policyRate" : policyName,
+            "state": serviceByCustomer[e["endUserId"]]["status"],
+            "block": serviceByCustomer[e["endUserId"]]["status"] != "Active"
+          })
+      if dualStack and e["ipv6Address"]:
+        dsGroup = {}
+        dsGroup["subscriberGroupName"] = "DS-%s" % e["endUserId"]
+        dsGroup["policyRate"] = policyName
+        dsGroup["subscriberMembers"] = [e["ipAddress"]]
+        parts = e["ipv6Address"].split('/')
+        if len(parts) == 2 and int(parts[1]) != ipv6Mask:
+          dsGroup["subscriberRanges"] = [e["ipv6Address"]]
+        else:
+          dsGroup["subscriberMembers"].append(IpAddress.toString(e["ipAddress"]))
+        data["subscriberGroups"].append(dsGroup)
+    
+    if networkSites:
+      nwGroups = {}
+      for e in equipments:
+        if not e["locationId"] in nwGroups:
+          nwGroups[e["locationId"]] = {
+            "subscriberGroupName": "L1-%s" % e["locationId"],
+            "subscriberMembers": [],
+            "subscriberRanges": []
+          }
+        nwGroups[e["locationId"]]["subscriberMembers"].append(e["ipAddress"])
+        if e["ipv6Address"]:
+          nwGroups[e["locationId"]]["subscriberMembers"].append(IpAddress.toString(e["ipv6Address"]))
+      data["subscriberGroups"] += [ x for x in list(nwGroups.values()) if len(x["subscriberMembers"]) > 0 or len(x["subscriberRanges"]) > 0 ]
+
+    return data
+
+################################################################################
+
+if __name__ == "__main__":
+
+  parser = argparse.ArgumentParser(
+    description="""
+  Synchronizes speed limits in Powercode REST API with BQN rate policies.
+
+  Requires an API key in Powercode and the REST API enabled in BQN.
+
+  Known limitations:
+  - Multiple IP addresses in same contract not supported.
+  - Synchronization may take several minutes.
+  - If the synchronization fails, no retry is attempted (must be don e externally).
+  - No scheduling of script execution (must be done externally).
+  - IPv6 addresses are assumed to be in ipv6Address field, of string type, with or without a /mask,
+    but could not be verified in a real PC system.
+  """, formatter_class=argparse.RawTextHelpFormatter)
+
+  parser.add_argument('-b', help='BQN address and REST credentials. If absent, no BQN synchronization',
+                      nargs=3, metavar=('BQN-IP', 'REST-USER', 'REST-PW'), dest='bqn')
+  parser.add_argument('-v', '--verbose', action='count', dest='verbose', default=0,
+                    help="Display extra informationt (repeat for increased verbosity)")
+  parser.add_argument('-c', '--categories', required=True, type=int, dest="categories", nargs='+', default=[1],
+      help='Equipment categories. Use as last option. [1] by default')
+  parser.add_argument('-ds', '--dual-stack', action='store_true', dest="dualStack", default=False, 
+      help='Group v4 and v6 IP addresses of same subscriber under same rate limit. Requires BQN R4.22 or later. If absent, no group created')
+  parser.add_argument('-msk', '--v6-expected-mask', help='Expected IPv6 mask. 64 by default.',
+               type=int, default=64, dest='ipv6Mask')
+  parser.add_argument('-ns', '--network-sites', action='store_true', dest="networkSites", default=False, 
+      help='Group subscribers based on their locations. Requires BQN R4.22 or later. If absent, no group created')
+
+  parser.add_argument('server', metavar='SERVER', type=str, help='Billing REST server')
+  parser.add_argument('key', metavar='KEY', type=str, help='Billing REST API key')
+  args = parser.parse_args()
+
+  billingSync = PowercodeSync(args.verbose)
+
+  billingSync.logger.warning("%s synchronization script starts (v1.1)" % datetime.datetime.now())
+
+  equipments = billingSync.getEquipments(args.server, args.key, args.categories)
+  ids = [x["endUserId"] for x in equipments]
+  services = billingSync.getServices(args.server, args.key, ids)
+  
+  data = billingSync.normalizeData(equipments, services, args.dualStack, args.ipv6Mask, args.networkSites)
+
+  billingSync.printData(data)
+  if args.bqn:
+    billingSync.updateBqn(args.bqn[0], args.bqn[1], args.bqn[2], data)
+
+  billingSync.logger.warning("%s synchronization script ends" % datetime.datetime.now())
+
+
+
