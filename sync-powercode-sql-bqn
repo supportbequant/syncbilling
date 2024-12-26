@@ -18,6 +18,8 @@ import json
 import argparse
 import datetime
 import subprocess
+import sys
+import os
 
 import requests
 if not requests.__version__.startswith("1."):
@@ -26,7 +28,6 @@ if not requests.__version__.startswith("1."):
   urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from BillingSync import BillingSync
-from IpAddress import IpAddress
 
 ################################################################################
 
@@ -82,12 +83,18 @@ EOF" | sshpass -p %s ssh -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile
         logFile if logFile else errFile
       )
     self.logger.debug(cmd)
-    proc = subprocess.run(cmd,
-            check=True, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            encoding='ascii')
-    with open(rspFile) as f:
-      return json.load(f)
+    # We use check_call instead of run because BQN pythion version is 3.3.
+    # We also update PATH to sshpass is found.
+    myEnv = os.environ
+    myEnv["PATH"] = "/opt/bqn/sbin:" + myEnv["PATH"]
+    subprocess.check_call(cmd,
+          shell=True,
+          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=myEnv)
+    with open(rspFile, encoding="utf-8") as f:
+      rsp = json.load(f)
+      # In BQN, if ensure_ascii=False it gives an error and no dump. OK in Linux box.
+      self.logger.debug(json.dumps(rsp,  indent=4, separators=(',', ':'), ensure_ascii=False))
+      return rsp
   
     return None
 
@@ -156,19 +163,18 @@ EOF" | sshpass -p %s ssh -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile
     if networkSites:
       nwGroups = {}
       for e in equipments:
-        if not e["location_id"] in nwGroups:
-          nwGroups[e["location_id"]] = {
-            "subscriberGroupName": "L1-%s" % e["location_id"],
-            "subscriberMembers": [],
-            "subscriberRanges": []
-          }
-        nwGroups[e["location_id"]]["subscriberMembers"].append(e["ipAddress"])
-        # We are assuming one IPv6 address range of /64 per subscriber
-        if e["ipv6AddressStart"]:
-          nwGroups[e["location_id"]]["subscriberMembers"].append(e["ipv6AddressStart"])
+        if e["location_id"]:
+          if not e["location_id"] in nwGroups:
+            nwGroups[e["location_id"]] = {
+              "subscriberGroupName": "L1-%s" % e["location_id"],
+              "subscriberMembers": [],
+              "subscriberRanges": []
+            }
+          nwGroups[e["location_id"]]["subscriberMembers"].append(e["ipAddress"])
+          # We are assuming one IPv6 address range of /64 per subscriber
+          if e["ipv6AddressStart"]:
+            nwGroups[e["location_id"]]["subscriberMembers"].append(e["ipv6AddressStart"])
       data["subscriberGroups"] += [ x for x in list(nwGroups.values()) if len(x["subscriberMembers"]) > 0 or len(x["subscriberRanges"]) > 0 ]
-
-    self.logger.debug(data)
 
     return data
 
